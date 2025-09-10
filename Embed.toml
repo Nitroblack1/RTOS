@@ -1,0 +1,17 @@
+# Embed.toml
+[default.general]
+chip = "STM32F446RE"        # 또는 환경에 따라 "STM32F446RETx"
+connect_under_reset = true  # 리셋 붙잡고 연결
+
+[default.probe]
+protocol = "Swd"
+speed = 100                 # 안 붙으면 50까지 내려보고, 붙으면 400→1000으로 점진 상승
+
+[default.reset]
+halt_afterwards = true      # 리셋 직후 코어 halt
+
+[default.rtt]
+enabled = false
+
+[default.gdb]
+enabled = false
