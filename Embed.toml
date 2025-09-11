@@ -11,7 +11,7 @@ speed = 100                 # 안 붙으면 50까지 내려보고, 붙으면 400
 halt_afterwards = true      # 리셋 직후 코어 halt
 
 [default.rtt]
-enabled = false
+enabled = true
 
 [default.gdb]
 enabled = false

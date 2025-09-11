@@ -11,8 +11,23 @@ use rtt_target::{rprintln, rtt_init_print};
 
 // ------------------------- SVC layer ------------------------
 mod svc {
-    use core::arch::{ asm, global_asm };
+    // --------------------- for rtt debug ----------------------
+    use core::sync::atomic::{ AtomicU32, Ordering };
 
+    static SVC_COUNTER: AtomicU32 = AtomicU32::new(0);
+    static NOW_COUNT: AtomicU32 = AtomicU32::new(0);
+    static BTN_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    pub fn svc_stats() -> (u32, u32, u32) {
+        (
+            SVC_COUNTER.load(Ordering::Relaxed),
+            NOW_COUNT.load(Ordering::Relaxed),
+            BTN_COUNT.load(Ordering::Relaxed),
+        )
+    }
+    // --------------------- end rtt debug ----------------------
+
+    use core::arch::{ asm, global_asm };
     use crate::os::Syscalls;
 
     // --------- ABI : call_id definitions ----------
@@ -70,10 +85,21 @@ mod svc {
     #[unsafe(no_mangle)]
     extern "C" fn svcall_rust(frame: &mut ExceptionFrame) {
         let call_id = (frame.r0 & 0xFF) as u8;
+
+        // ------------------ for rtt debug -------------------
+        SVC_COUNTER.fetch_add(1, Ordering::Relaxed);
+        match call_id {
+            abi::NOW_MS => { NOW_COUNT.fetch_add(1, Ordering::Relaxed); }
+            2 => { BTN_COUNT.fetch_add(1, Ordering::Relaxed); }
+            _ => {}
+        }
+        // ---------------- end rtt debug ---------------------
+
         let a0 = frame.r1;
         let a1 = frame.r2;
         let a2 = frame.r3;
         let a3 = frame.r12;
+        
         let ret = unsafe { kernel_dispatch(call_id, a0, a1, a2, a3) };
         frame.r0 = ret;
     }
@@ -205,10 +231,15 @@ mod os {
 // ------------------------- Apps ----------------------------
 mod apps {
     use super::os::{App, GpioPin, Syscalls};
+    use rtt_target::rprintln;
 
     /// Heartbeat: steady blink on PA5 (both Led1/Led2 mapped) to show liveness.
-    pub struct HeartbeatApp { last: u64, on: bool, period_ms: u32 }
-    impl HeartbeatApp { pub const fn new(period_ms: u32) -> Self { Self { last: 0, on: false, period_ms } } }
+    pub struct HeartbeatApp { last: u64, on: bool, period_ms: u32, dbg_last_log: u64 }
+    impl HeartbeatApp {
+        pub const fn new(period_ms: u32) -> Self {
+             Self { last: 0, on: false, period_ms, dbg_last_log: 0 } 
+            } 
+    }
     impl App for HeartbeatApp {
         fn name(&self) -> &'static str { "heartbeat" }
         fn tick(&mut self, sys: &mut dyn Syscalls) {
@@ -219,6 +250,15 @@ mod apps {
                 sys.gpio_write(GpioPin::Led2, self.on);
                 self.last = now;
             }
+
+            // ---- for rtt debug: 1초마다 SVC 통계 출력 ---
+            if now.wrapping_sub(self.dbg_last_log) >= 1000 {
+                let (svc, nowc, btnc) = crate::svc::svc_stats();
+                rprintln!("SVC hits: total={}, now_ms={}, btn={}", svc, nowc, btnc);
+                self.dbg_last_log = now;
+            }
+            // ------------------------------------------
+
             sys.sleep_ms(1);
         }
     }
