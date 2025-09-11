@@ -407,16 +407,22 @@ fn main() -> ! {
     rprintln!("[mini-os] booting (button-controlled switching)");
 
     // Map both logical LEDs to PA5 for visibility; button is PC13.
-    let mut syscalls = board::BoardSyscalls::new(
+    let mut board = board::BoardSyscalls::new(
         board::RawPin::new(board::GPIOA, 5),  // Led1 → PA5
         board::RawPin::new(board::GPIOA, 5),  // Led2 → PA5
         board::RawPin::new(board::GPIOC, 13), // Btn  → PC13
         CYCLES_PER_MS_ESTIMATE,
     );
 
-    unsafe { syscalls.init(); }
+    unsafe { board.init(); }
     rprintln!("GPIO ready: PA5 output, PC13 input-pullup");
 
+    // SVC Handler에 커널 보드 포인터 등록
+    unsafe { svc::register_kernel_board(&mut board as *mut _); }
+
+    // Syscalls 클라이언트 생성
+    let mut syscalls = unsafe { svc::Client::new(&mut board) };
+    
     // Two apps: 0 = heartbeat, 1 = SOS
     let mut app_beat = apps::HeartbeatApp::new(3);
     let mut app_sos  = apps::LedSosApp::new();
