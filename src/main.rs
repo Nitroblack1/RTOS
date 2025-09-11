@@ -15,6 +15,123 @@ use cortex_m_rt::entry;
 use panic_halt as _;
 use rtt_target::{rprintln, rtt_init_print};
 
+// ------------------------- SVC layer ------------------------
+mod svc {
+    use core::arch::{ asm, global_asm };
+
+    use crate::os::Syscalls;
+
+    // --------- ABI : call_id definitions ----------
+    pub mod abi {
+        pub const NOW_MS: u8 = 1;
+    }
+
+    // --------- 공용 SVC call wrapper ----------------
+    #[inline(always)]
+    pub fn svc_call(call_id: u8, a0: u32, a1: u32, a2: u32, a3: u32) -> u32 {
+        let mut r0 = call_id as u32;
+        unsafe {
+            asm!(
+                "svc 0",
+                inlateout("r0") r0,
+                in("r1") a0,
+                in("r2") a1,
+                in("r3") a2,
+                in("r12") a3,
+                options(nostack)
+            );
+        }
+        r0
+    }
+
+    #[repr(C)]
+    pub struct ExceptionFrame {
+        pub r0: u32,
+        pub r1: u32,
+        pub r2: u32,
+        pub r3: u32,
+        pub r12: u32,
+        pub lr: u32,
+        pub pc: u32,
+        pub xpsr: u32,
+    }
+
+    // Removed duplicate declaration of svcall_rust to avoid multiple definitions.
+
+    global_asm!(
+        r#"
+        .global SVCall
+        .type   SVCall, %function
+    SVCall:
+        tst     lr, #4
+        ite     eq
+        mrseq   r0, msp
+        mrsne   r0, psp
+        b       {svcrust}
+    "#,
+        svcrust = sym crate::svc::svcall_rust
+    );
+
+    #[unsafe(no_mangle)]
+    extern "C" fn svcall_rust(frame: &mut ExceptionFrame) {
+        let call_id = (frame.r0 & 0xFF) as u8;
+        let a0 = frame.r1;
+        let a1 = frame.r2;
+        let a2 = frame.r3;
+        let a3 = frame.r12;
+        let ret = unsafe { kernel_dispatch(call_id, a0, a1, a2, a3) };
+        frame.r0 = ret;
+    }
+
+    // --------- (4) 커널(Board) 접근 포인터 등록 ----------
+    static mut BOARD_PTR: *mut crate::board::BoardSyscalls = core::ptr::null_mut();
+    pub unsafe fn register_kernel_board(p: *mut crate::board::BoardSyscalls) {
+        unsafe { BOARD_PTR = p };
+    }
+
+    // --------- (5) 실제 디스패처: 지금은 NOW_MS만 처리 ----------
+    unsafe fn kernel_dispatch(call_id: u8, _a0: u32, _a1: u32, _a2: u32, _a3: u32) -> u32 {
+        let board = unsafe { &mut *BOARD_PTR };
+        match call_id {
+            abi::NOW_MS => board.now_ms() as u32,
+            _ => 0xFFFF_FFFF, // unknown
+        }
+    }
+
+    // --------- (6) Syscalls용 SVC 클라이언트 래퍼 ----------
+    // fallback을 위해 보드 포인터 보관 (raw pointer로 보관: 빌림 충돌 회피)
+    pub struct Client {
+        board: *mut crate::board::BoardSyscalls
+    }
+    impl Client {
+        pub unsafe fn new(board: &mut crate::board::BoardSyscalls) -> Self {
+            Self { board: board as *mut _ }
+        }
+    }
+
+    // 기존 os::Syscalls 트레이트를 이 클라이언트가 구현
+    impl crate::os::Syscalls for Client {
+        // 1) now_ms만 SVC로 넘겨 테스트
+        fn now_ms(&self) -> u64 {
+            svc_call(abi::NOW_MS, 0, 0, 0, 0) as u64
+        }
+
+        // 2) 나머지는 일단 보드 직접 호출로 fallback (점진 전환)
+        fn sleep_ms(&mut self, ms: u32) {
+            unsafe { (&mut *self.board).sleep_ms(ms) }
+        }
+        fn gpio_write(&mut self, pin: crate::os::GpioPin, high: bool) {
+            unsafe { (&mut *self.board).gpio_write(pin, high) }
+        }
+        fn gpio_toggle(&mut self, pin: crate::os::GpioPin) {
+            unsafe { (&mut *self.board).gpio_toggle(pin) }
+        }
+        fn user_button_pressed(&self) -> bool {
+            unsafe { (&*self.board).user_button_pressed() }
+        }
+    }
+}
+
 // ------------------------- OS Core -------------------------
 mod os {
     #[derive(Copy, Clone, Debug)]
