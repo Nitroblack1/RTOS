@@ -18,6 +18,7 @@ mod svc {
     // --------- ABI : call_id definitions ----------
     pub mod abi {
         pub const NOW_MS: u8 = 1;
+        pub const BTN_PRESSED: u8 = 2;
     }
 
     // --------- 공용 SVC call wrapper ----------------
@@ -88,6 +89,7 @@ mod svc {
         let board = unsafe { &mut *BOARD_PTR };
         match call_id {
             abi::NOW_MS => board.now_ms() as u32,
+            abi::BTN_PRESSED => if board.user_button_pressed() { 1 } else { 0 },
             _ => 0xFFFF_FFFF, // unknown
         }
     }
@@ -121,7 +123,8 @@ mod svc {
             unsafe { (&mut *self.board).gpio_toggle(pin) }
         }
         fn user_button_pressed(&self) -> bool {
-            unsafe { (&*self.board).user_button_pressed() }
+            svc_call(abi::BTN_PRESSED, 0, 0, 0, 0) != 0
+            // unsafe { (&mut *self.board).user_button_pressed() }
         }
     }
 }
