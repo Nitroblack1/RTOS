@@ -34,6 +34,9 @@ mod svc {
     pub mod abi {
         pub const NOW_MS: u8 = 1;
         pub const BTN_PRESSED: u8 = 2;
+        pub const GPIO_WRITE: u8 = 3;
+        pub const GPIO_TOGGLE: u8 = 4;
+        pub const SLEEP_MS: u8 = 5;
     }
 
     // --------- 공용 SVC call wrapper ----------------
@@ -90,7 +93,7 @@ mod svc {
         SVC_COUNTER.fetch_add(1, Ordering::Relaxed);
         match call_id {
             abi::NOW_MS => { NOW_COUNT.fetch_add(1, Ordering::Relaxed); }
-            2 => { BTN_COUNT.fetch_add(1, Ordering::Relaxed); }
+            abi::BTN_PRESSED => { BTN_COUNT.fetch_add(1, Ordering::Relaxed); }
             _ => {}
         }
         // ---------------- end rtt debug ---------------------
@@ -99,7 +102,7 @@ mod svc {
         let a1 = frame.r2;
         let a2 = frame.r3;
         let a3 = frame.r12;
-        
+
         let ret = unsafe { kernel_dispatch(call_id, a0, a1, a2, a3) };
         frame.r0 = ret;
     }
@@ -111,11 +114,33 @@ mod svc {
     }
 
     // --------- (5) 실제 디스패처: 지금은 NOW_MS만 처리 ----------
-    unsafe fn kernel_dispatch(call_id: u8, _a0: u32, _a1: u32, _a2: u32, _a3: u32) -> u32 {
+    unsafe fn kernel_dispatch(call_id: u8, a0: u32, a1: u32, _a2: u32, _a3: u32) -> u32 {
         let board = unsafe { &mut *BOARD_PTR };
         match call_id {
             abi::NOW_MS => board.now_ms() as u32,
-            abi::BTN_PRESSED => if board.user_button_pressed() { 1 } else { 0 },
+
+            abi::BTN_PRESSED => {
+                if board.user_button_pressed() { 1 } else { 0 }
+            },
+
+            abi::GPIO_WRITE => {
+                let pin_enum = if a0 == 0 { crate::os::GpioPin::Led1 } 
+                                        else { crate::os::GpioPin::Led2 };
+                board.gpio_write(pin_enum, a1 != 0);
+                0
+            }
+
+            abi::GPIO_TOGGLE => {
+                let pin_enum = if a0 == 0 { crate::os::GpioPin::Led1 } else { crate::os::GpioPin::Led2 };
+                board.gpio_toggle(pin_enum);
+                0
+            }
+
+            abi::SLEEP_MS => {
+                board.sleep_ms(a0);
+                0
+            }
+
             _ => 0xFFFF_FFFF, // unknown
         }
     }
@@ -133,24 +158,29 @@ mod svc {
 
     // 기존 os::Syscalls 트레이트를 이 클라이언트가 구현
     impl crate::os::Syscalls for Client {
-        // 1) now_ms만 SVC로 넘겨 테스트
         fn now_ms(&self) -> u64 {
             svc_call(abi::NOW_MS, 0, 0, 0, 0) as u64
         }
-
-        // 2) 나머지는 일단 보드 직접 호출로 fallback (점진 전환)
         fn sleep_ms(&mut self, ms: u32) {
-            unsafe { (&mut *self.board).sleep_ms(ms) }
+            let _ = svc_call(abi::SLEEP_MS, ms, 0, 0, 0);
         }
         fn gpio_write(&mut self, pin: crate::os::GpioPin, high: bool) {
-            unsafe { (&mut *self.board).gpio_write(pin, high) }
+            let p = match pin {
+                crate::os::GpioPin::Led1 => 0u32,
+                crate::os::GpioPin::Led2 => 1u32,
+            };
+            let h = if high { 1u32 } else { 0u32 };
+            let _ = svc_call(abi::GPIO_WRITE, p, h, 0, 0);
         }
         fn gpio_toggle(&mut self, pin: crate::os::GpioPin) {
-            unsafe { (&mut *self.board).gpio_toggle(pin) }
+            let p = match pin {
+                crate::os::GpioPin::Led1 => 0u32,
+                crate::os::GpioPin::Led2 => 1u32,
+            };
+            let _ = svc_call(abi::GPIO_TOGGLE, p, 0, 0, 0);
         }
         fn user_button_pressed(&self) -> bool {
             svc_call(abi::BTN_PRESSED, 0, 0, 0, 0) != 0
-            // unsafe { (&mut *self.board).user_button_pressed() }
         }
     }
 }
