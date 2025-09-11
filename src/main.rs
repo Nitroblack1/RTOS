@@ -1,14 +1,8 @@
 // mini_os_app_framework.rs (Button-controlled app switching, STM32F446)
 // - Board: STM32F446 (e.g., Nucleo-F446RE)
-// - LEDs: Map BOTH logical LEDs to PA5 (LD2) so everything is visible.
-// - Button: Use user button B1 on PC13 with pull-up; pressed = LOW.
-// - Clock: assume HSI 16 MHz; adjust CYCLES_PER_MS_ESTIMATE as needed.
 #![no_std]
 #![no_main]
 #![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(non_snake_case)]
 
 
 use cortex_m_rt::entry;
