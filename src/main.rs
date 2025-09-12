@@ -475,6 +475,53 @@ mod board {
 // --------------------------- main ---------------------------
 const CYCLES_PER_MS_ESTIMATE: u32 = 16_000; // HSI 16 MHz (tune if needed)
 
+// --- Unpriviledged Thread + PSP 전환용 유저 스택 (8바이트 정렬) ---
+use core::ptr::addr_of_mut;
+const STACK_BYTES: usize = 2048;
+#[repr(align(8))]
+struct UserStack([u8; 2048]);
+static mut USER_STACK: UserStack = UserStack([0; STACK_BYTES]);  // size can be adjusted
+
+// --- PSP 사용 + Unpriviledged Thread 모드 전환 ---
+unsafe fn switch_to_unpriv_psp() {
+    use cortex_m::register::psp;
+
+    let base: *mut u8 = unsafe { addr_of_mut!(USER_STACK.0) as *mut u8 };
+
+    // PSP를 유저 스택 최상단으로 설정 (8바이트 정렬 보장)
+    let top_ptr = unsafe { base.add(STACK_BYTES) as u32 };
+
+    unsafe { psp::write(top_ptr); }
+
+    // CONTROL 레지스터: SPSEL=1(PSP), nPRIV=1(Unpriviledged)
+    unsafe {
+        core::arch::asm!(
+            "mrs r0, CONTROL",
+            "orr r0, r0, #2",   // SPSEL=1
+            "msr CONTROL, r0",
+            "isb",
+            "mrs r0, CONTROL",
+            "orr r0, r0, #1",   // nPRIV=1
+            "msr CONTROL, r0",
+            "isb",
+            out("r0") _,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+#[inline(always)]
+pub(crate) fn is_unpriv_thread() -> bool {
+    let mut control: u32;
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, CONTROL",
+            out(reg) control,
+        );
+    }
+    control & 1 != 0    // 1이면 Unpriviledged Thread 모드
+}
+
 #[entry]
 fn main() -> ! {
     rtt_init_print!();
