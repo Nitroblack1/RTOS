@@ -57,6 +57,8 @@ mod svc {
         r0
     }
 
+    // --------- (1) ExceptionFrame 구조체 정의 ----------
+    // 참고: https://interrupt.memfault.com/blog/cortex-m-exception-handling
     #[repr(C)]
     pub struct ExceptionFrame {
         pub r0: u32,
@@ -69,23 +71,22 @@ mod svc {
         pub xpsr: u32,
     }
 
-    // Removed duplicate declaration of svcall_rust to avoid multiple definitions.
-
+    // --------- (2) SVC 핸들러 어셈블리: ExceptionFrame 포인터를 인수로 전달 ----------
     global_asm!(
         r#"
         .global SVCall
         .type   SVCall, %function
     SVCall:
-        tst     lr, #4
-        ite     eq
-        mrseq   r0, msp
-        mrsne   r0, psp
-        b       {svcrust}
+        tst     lr, #4      // EXC_RETURN bit 2: 0=MSP, 1=PSP
+        ite     eq          // if-then-else
+        mrseq   r0, msp    // r0 = stack ptr (MSP or PSP)
+        mrsne   r0, psp    // (on thread mode)
+        b       {svcrust}  // call Rust handler
     "#,
         svcrust = sym crate::svc::svcall_rust
     );
 
-    #[unsafe(no_mangle)]
+    // --------- (3) SVC 핸들러: ExceptionFrame 포인터 인수로 받음 ----------
     extern "C" fn svcall_rust(frame: &mut ExceptionFrame) {
         let call_id = (frame.r0 & 0xFF) as u8;
 
