@@ -1,4 +1,4 @@
-// mini_os_app_framework.rs (Button-controlled app switching, STM32F446)
+// mini_os_app_framework.rs
 // - Board: STM32F446 (e.g., Nucleo-F446RE)
 #![no_std]
 #![no_main]
@@ -16,13 +16,11 @@ mod svc {
 
     static SVC_COUNTER: AtomicU32 = AtomicU32::new(0);
     static NOW_COUNT: AtomicU32 = AtomicU32::new(0);
-    static BTN_COUNT: AtomicU32 = AtomicU32::new(0);
 
-    pub fn svc_stats() -> (u32, u32, u32) {
+    pub fn svc_stats() -> (u32, u32) {
         (
             SVC_COUNTER.load(Ordering::Relaxed),
-            NOW_COUNT.load(Ordering::Relaxed),
-            BTN_COUNT.load(Ordering::Relaxed),
+            NOW_COUNT.load(Ordering::Relaxed)
         )
     }
     // --------------------- end rtt debug ----------------------
@@ -33,10 +31,9 @@ mod svc {
     // --------- ABI : call_id definitions ----------
     pub mod abi {
         pub const NOW_MS: u8 = 1;
-        pub const BTN_PRESSED: u8 = 2;
-        pub const GPIO_WRITE: u8 = 3;
-        pub const GPIO_TOGGLE: u8 = 4;
-        pub const SLEEP_MS: u8 = 5;
+        pub const GPIO_WRITE: u8 = 2;
+        pub const GPIO_TOGGLE: u8 = 3;
+        pub const SLEEP_MS: u8 = 4;
     }
 
     // --------- 공용 SVC call wrapper ----------------
@@ -94,7 +91,6 @@ mod svc {
         SVC_COUNTER.fetch_add(1, Ordering::Relaxed);
         match call_id {
             abi::NOW_MS => { NOW_COUNT.fetch_add(1, Ordering::Relaxed); }
-            abi::BTN_PRESSED => { BTN_COUNT.fetch_add(1, Ordering::Relaxed); }
             _ => {}
         }
         // ---------------- end rtt debug ---------------------
@@ -114,15 +110,11 @@ mod svc {
         unsafe { BOARD_PTR = p };
     }
 
-    // --------- (5) 실제 디스패처: 지금은 NOW_MS만 처리 ----------
+    // --------- (5) 실제 디스패처 ----------
     unsafe fn kernel_dispatch(call_id: u8, a0: u32, a1: u32, _a2: u32, _a3: u32) -> u32 {
         let board = unsafe { &mut *BOARD_PTR };
         match call_id {
             abi::NOW_MS => board.now_ms() as u32,
-
-            abi::BTN_PRESSED => {
-                if board.user_button_pressed() { 1 } else { 0 }
-            },
 
             abi::GPIO_WRITE => {
                 let pin_enum = if a0 == 0 { crate::os::GpioPin::Led1 } 
@@ -180,9 +172,6 @@ mod svc {
             };
             let _ = svc_call(abi::GPIO_TOGGLE, p, 0, 0, 0);
         }
-        fn user_button_pressed(&self) -> bool {
-            svc_call(abi::BTN_PRESSED, 0, 0, 0, 0) != 0
-        }
     }
 }
 
@@ -196,7 +185,6 @@ mod os {
         fn gpio_toggle(&mut self, pin: GpioPin);
         fn sleep_ms(&mut self, ms: u32);
         fn now_ms(&self) -> u64;
-        fn user_button_pressed(&self) -> bool; // ← Board input exposed as a syscall
     }
 
     pub trait App {
@@ -209,8 +197,6 @@ mod os {
         ByName(&'a str),
         ByIndex(usize),
         All,
-        /// Run `primary` app while button is released; run `secondary` while pressed.
-        SwitchOnButton { primary: usize, secondary: usize },
     }
 
     pub struct Os<'a> {
@@ -242,18 +228,6 @@ mod os {
                 AppCall::All => {
                     loop { for a in self.apps.iter_mut() { a.tick(self.sys); } }
                 }
-                AppCall::SwitchOnButton { mut primary, mut secondary } => {
-                    let len = self.apps.len();
-                    primary %= len; secondary %= len;
-                    loop {
-                        if self.sys.user_button_pressed() {
-                            self.apps[secondary].tick(self.sys);
-                        } else {
-                            self.apps[primary].tick(self.sys);
-                        }
-                        self.sys.sleep_ms(1); // debounce / cooperative yield
-                    }
-                }
             }
         }
     }
@@ -284,8 +258,8 @@ mod apps {
 
             // ---- for rtt debug: 1초마다 SVC 통계 출력 ---
             if now.wrapping_sub(self.dbg_last_log) >= 1000 {
-                let (svc, nowc, btnc) = crate::svc::svc_stats();
-                rprintln!("SVC hits: total={}, now_ms={}, btn={}", svc, nowc, btnc);
+                let (svc, nowc) = crate::svc::svc_stats();
+                rprintln!("SVC hits: total={}, now_ms={}", svc, nowc);
                 self.dbg_last_log = now;
             }
             // ------------------------------------------
@@ -459,13 +433,6 @@ mod board {
         }
         fn sleep_ms(&mut self, ms: u32) { self.spin_delay(ms); }
         fn now_ms(&self) -> u64 { self.time_ms }
-        fn user_button_pressed(&self) -> bool {
-            unsafe {
-                // B1 on Nucleo-F446RE (PC13): pull-up. Pressed => level LOW.
-                let high = gpio_read_input(self.btn.port_base, self.btn.pin);
-                !high
-            }
-        }
     }
 
     pub const GPIOA: u32 = GPIOA_BASE;
@@ -551,5 +518,5 @@ fn main() -> ! {
 
     let mut kernel = os::Os::new(&mut app_list, &mut syscalls);
     // Button not pressed => heartbeat; pressed => SOS
-    kernel.run(os::AppCall::SwitchOnButton { primary: 0, secondary: 1 })
+    kernel.run(os::AppCall::All);
 }
