@@ -9,6 +9,38 @@ use cortex_m_rt::entry;
 use panic_halt as _;
 use rtt_target::{rprintln, rtt_init_print};
 
+
+// ------------------------- Capsules (no unsafe) ------------------------
+mod capsules {
+    #![forbid(unsafe_code)]
+    use crate::{board, os::GpioPin};
+    
+    // MuxGpio: 여러 클라이언트가 하나의 GPIO 핀을 공유할 수 있게 함
+    pub struct MuxGpio {
+        led1: &'static board::GpioPriv,
+        led2: &'static board::GpioPriv,
+    }
+
+    impl MuxGpio {
+        pub const fn new(led1: &'static board::GpioPriv, led2: &'static board::GpioPriv) -> Self {
+            Self { led1, led2 }
+        }
+        #[inline]
+        pub fn write(&self, pin: GpioPin, high: bool) {
+            match pin {
+                GpioPin::Led1 => self.led1.write(high),
+                GpioPin::Led2 => self.led2.write(high),
+            }
+        }
+        pub fn toggle(&self, pin: GpioPin) {
+            match pin {
+                GpioPin::Led1 => self.led1.toggle(),
+                GpioPin::Led2 => self.led2.toggle(),
+            }
+        }
+    }
+}
+
 // ------------------------- SVC layer ------------------------
 mod svc {
     // --------------------- for rtt debug ----------------------
@@ -435,6 +467,22 @@ mod board {
         fn now_ms(&self) -> u64 { self.time_ms }
     }
 
+    // ------------- Privileged Object: GpioPriv -----------------
+    pub struct GpioPriv { pub(crate) port_base: u32, pub(crate) pin: u8 }
+    impl GpioPriv {
+        pub const unsafe fn new_privileged_const(port_base: u32, pin: u8) -> Self {
+            Self { port_base, pin }
+        }
+        #[inline]
+        pub fn write(&self, high: bool) {
+            unsafe { gpio_write(self.port_base, self.pin, high); }
+        }
+        #[inline]
+        pub fn toggle(&self) {
+            unsafe { gpio_toggle(self.port_base, self.pin); }
+        }
+    }
+    
     pub const GPIOA: u32 = GPIOA_BASE;
     pub const GPIOC: u32 = GPIOC_BASE;
 }
