@@ -220,106 +220,6 @@ mod os {
         fn sleep_ms(&mut self, ms: u32);
         fn now_ms(&self) -> u64;
     }
-
-    pub trait App {
-        fn name(&self) -> &'static str;
-        fn init(&mut self, _sys: &mut dyn Syscalls) {}
-        fn tick(&mut self, sys: &mut dyn Syscalls);
-    }
-
-    pub enum AppCall<'a> {
-        ByName(&'a str),
-        ByIndex(usize),
-        All,
-    }
-
-    pub struct Os<'a> {
-        apps: &'a mut [&'a mut dyn App],
-        sys: &'a mut dyn Syscalls,
-        started: bool,
-    }
-
-    impl<'a> Os<'a> {
-        pub fn new(apps: &'a mut [&'a mut dyn App], sys: &'a mut dyn Syscalls) -> Self {
-            Self { apps, sys, started: false }
-        }
-        pub fn run(&'a mut self, call: AppCall<'a>) -> ! {
-            // One-time init for all apps
-            if !self.started { for a in self.apps.iter_mut() { a.init(self.sys); } self.started = true; }
-
-            assert!(!self.apps.is_empty(), "no apps to run");
-
-            match call {
-                AppCall::ByIndex(mut i) => {
-                    i %= self.apps.len();
-                    loop { self.apps[i].tick(self.sys); }
-                }
-                AppCall::ByName(name) => {
-                    let mut idx = 0usize;
-                    for (i, a) in self.apps.iter().enumerate() { if a.name() == name { idx = i; break; } }
-                    loop { self.apps[idx].tick(self.sys); }
-                }
-                AppCall::All => {
-                    loop { for a in self.apps.iter_mut() { a.tick(self.sys); } }
-                }
-            }
-        }
-    }
-}
-
-// ------------------------- Apps ----------------------------
-mod apps {
-    use super::os::{App, GpioPin, Syscalls};
-    use rtt_target::rprintln;
-
-    /// Heartbeat: steady blink on PA5 (both Led1/Led2 mapped) to show liveness.
-    pub struct HeartbeatApp { last: u64, on: bool, period_ms: u32, dbg_last_log: u64 }
-    impl HeartbeatApp {
-        pub const fn new(period_ms: u32) -> Self {
-             Self { last: 0, on: false, period_ms, dbg_last_log: 0 } 
-            } 
-    }
-    impl App for HeartbeatApp {
-        fn name(&self) -> &'static str { "heartbeat" }
-        fn tick(&mut self, sys: &mut dyn Syscalls) {
-            let now = sys.now_ms();
-            if now.wrapping_sub(self.last) >= self.period_ms as u64 {
-                self.on = !self.on;
-                sys.gpio_write(GpioPin::Led1, self.on);
-                sys.gpio_write(GpioPin::Led2, self.on);
-                self.last = now;
-            }
-
-            // ---- for rtt debug: 1초마다 SVC 통계 출력 ---
-            if now.wrapping_sub(self.dbg_last_log) >= 1000 {
-                let (svc, nowc) = crate::svc::svc_stats();
-                rprintln!("SVC hits: total={}, now_ms={}", svc, nowc);
-                self.dbg_last_log = now;
-            }
-            // ------------------------------------------
-
-            sys.sleep_ms(1);
-        }
-    }
-
-    /// SOS pattern on PA5: ··· ––– ···, repeats
-    pub struct LedSosApp;
-    impl LedSosApp { pub const fn new() -> Self { Self } }
-    impl App for LedSosApp {
-        fn name(&self) -> &'static str { "led_sos" }
-        fn tick(&mut self, sys: &mut dyn Syscalls) {
-            const DOT: u32 = 2; const DASH: u32 = 6; const GAP: u32 = 2; const WORD: u32 = 7;
-            let mut pulse = |dur: u32| {
-                sys.gpio_write(GpioPin::Led2, true);  sys.sleep_ms(dur);
-                sys.gpio_write(GpioPin::Led2, false); sys.sleep_ms(GAP);
-            };
-            for _ in 0..2 { pulse(DOT); }
-            for _ in 0..2 { pulse(DASH); }
-            for _ in 0..2 { pulse(DOT); }
-            sys.sleep_ms(WORD);
-        }
-    }
-
 }
 
 // -------------- Board layer: STM32F446 raw registers ---------
@@ -501,8 +401,9 @@ pub(crate) static GPIO_CAP: capsules::MuxGpio = capsules::MuxGpio::new(&GPIO_LED
 // --------------------------- Schedular (preemptive RR @ 50us) ---------------------------
 mod sched {
     use core::arch::global_asm;
-
     use cortex_m_rt::exception;
+    use rtt_target::{rprintln};
+    use crate::{task0_entry, task1_entry, task2_entry};
 
     pub const N_TASKS: usize = 3;
     const STACK_WORDS: usize = 256; // 1KB stack per task
@@ -525,12 +426,6 @@ mod sched {
      // Addresses for SCB registers (for priority+PendSV trigger)
     const ICSR: *mut u32  = 0xE000_ED04 as *mut u32; // bit28 = PENDSVSET
     const SHPR3:*mut u32  = 0xE000_ED20 as *mut u32; // [31:24]=SysTick, [23:16]=PendSV
-
-    unsafe extern "C" {
-    fn task0_entry() -> !;
-    fn task1_entry() -> !;
-    fn task2_entry() -> !;
-    }
 
     #[inline(always)]
     fn build_initial_psp(stack: &mut [u32], entry_addr: u32) -> u32 {
@@ -584,6 +479,7 @@ mod sched {
     }
 
     pub fn start() -> ! {
+        rprintln!("Starting tasks... ");
         unsafe {
             core::ptr::write_volatile(ICSR, 1 << 28);
         }
@@ -600,6 +496,13 @@ mod sched {
         bl      {switch}
         ldmia   r0!, {{r4-r11}}
         msr     psp, r0
+
+        mrs     r1, CONTROL
+        orr     r1, r1, #2      // SPSEL=1(PSP)
+        orr     r1, r1, #1      // nPRIV=1(Unpriviledged)
+        msr     CONTROL, r1
+        isb
+
         bx      lr
     "#
 
@@ -662,39 +565,12 @@ pub extern "C" fn task2_entry() -> ! {
 const CYCLES_PER_MS_ESTIMATE: u32 = 16_000; // HSI 16 MHz (tune if needed)
 
 // --- Unpriviledged Thread + PSP 전환용 유저 스택 (8바이트 정렬) ---
-use core::ptr::addr_of_mut;
 const STACK_BYTES: usize = 2048;
 #[repr(align(8))]
 struct UserStack([u8; 2048]);
 static mut USER_STACK: UserStack = UserStack([0; STACK_BYTES]);  // size can be adjusted
 
-// --- PSP 사용 + Unpriviledged Thread 모드 전환 ---
-unsafe fn switch_to_unpriv_psp() {
-    use cortex_m::register::psp;
 
-    let base: *mut u8 = unsafe { addr_of_mut!(USER_STACK.0) as *mut u8 };
-
-    // PSP를 유저 스택 최상단으로 설정 (8바이트 정렬 보장)
-    let top_ptr = unsafe { base.add(STACK_BYTES) as u32 };
-
-    unsafe { psp::write(top_ptr); }
-
-    // CONTROL 레지스터: SPSEL=1(PSP), nPRIV=1(Unpriviledged)
-    unsafe {
-        core::arch::asm!(
-            "mrs r0, CONTROL",
-            "orr r0, r0, #2",   // SPSEL=1
-            "msr CONTROL, r0",
-            "isb",
-            "mrs r0, CONTROL",
-            "orr r0, r0, #1",   // nPRIV=1
-            "msr CONTROL, r0",
-            "isb",
-            out("r0") _,
-            options(nostack, preserves_flags)
-        );
-    }
-}
 
 #[inline(always)]
 pub(crate) fn is_unpriv_thread() -> bool {
@@ -706,6 +582,15 @@ pub(crate) fn is_unpriv_thread() -> bool {
         );
     }
     control & 1 != 0    // 1이면 Unpriviledged Thread 모드
+}
+
+// HardFault 핸들러: SP 전환 문제로 인한 오류 시 메시지 출력
+use cortex_m_rt::exception;
+
+#[exception]
+unsafe fn HardFault(_ef: &cortex_m_rt::ExceptionFrame) -> ! {
+    rtt_target::rprintln!("*** HardFault! (likely due to bad SP switch) ***");
+    loop {}
 }
 
 #[entry]
@@ -729,13 +614,21 @@ fn main() -> ! {
 
     // Syscalls 클라이언트 생성
     let mut syscalls = unsafe { svc::Client::new(&mut board) };
+    unsafe { SYSCALLS_PTR = &mut syscalls as *mut _; }
     
-    // Two apps: 0 = heartbeat, 1 = SOS
-    let mut app_beat = apps::HeartbeatApp::new(3);
-    let mut app_sos  = apps::LedSosApp::new();
-    let mut app_list: [&mut dyn os::App; 2] = [ &mut app_beat, &mut app_sos ];
+    // // Two apps: 0 = heartbeat, 1 = SOS
+    // let mut app_beat = apps::HeartbeatApp::new(3);
+    // let mut app_sos  = apps::LedSosApp::new();
+    // let mut app_list: [&mut dyn os::App; 2] = [ &mut app_beat, &mut app_sos ];
 
-    let mut kernel = os::Os::new(&mut app_list, &mut syscalls);
-    // Button not pressed => heartbeat; pressed => SOS
-    kernel.run(os::AppCall::All);
+    // let mut kernel = os::Os::new(&mut app_list, &mut syscalls);
+    // // Button not pressed => heartbeat; pressed => SOS
+    // kernel.run(os::AppCall::All);
+
+    unsafe {
+        sched::init_tasks();
+        sched::init_systick_50us();
+        rprintln!("Starting preemptive multitasking with {} tasks", sched::N_TASKS);
+    }
+    sched::start();
 }
