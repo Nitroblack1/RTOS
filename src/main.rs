@@ -615,6 +615,49 @@ mod sched {
 }
 
 
+use crate::os::Syscalls;
+static mut SYSCALLS_PTR: *mut svc::Client = core::ptr::null_mut();
+#[inline(always)]
+fn syscalls() -> &'static mut svc::Client {
+    unsafe { &mut *SYSCALLS_PTR }
+}
+
+// --------------------------- Tasks ---------------------------
+// 각 태스크는 무한 루프에서 LED 토글 및 딜레이 수행
+// (딜레이는 busy-wait로 구현, 실제론 SVC로 sleep_ms() 호출하는 게 바람직)
+// (여기선 단순화를 위해 busy-wait 사용)
+// (task2는 1초마다 RTT 로그 출력, SVC 통계 확인용
+pub extern "C" fn task0_entry() -> ! {
+    loop {
+        syscalls().gpio_toggle(os::GpioPin::Led1);
+        for _ in 0..300 { cortex_m::asm::nop(); }
+    }
+}
+
+pub extern "C" fn task1_entry() -> ! {
+    loop {
+        syscalls().gpio_toggle(os::GpioPin::Led2);
+        for _ in 0..800 { cortex_m::asm::nop(); }
+    }
+}
+
+pub extern "C" fn task2_entry() -> ! {
+    // 1초마다 rtt 로그
+    static mut LAST: u64 = 0;
+    loop {
+        let now = syscalls().now_ms();
+        unsafe {
+            if now.wrapping_sub(LAST) >= 1_000 {
+                rtt_target::rprintln!("[task2] now={} ms", now);
+                LAST = now;
+            }
+        }
+        for _ in 0..1200 { cortex_m::asm::nop(); }
+    }
+}
+// --------------------------- end Tasks ---------------------------
+
+
 // --------------------------- main ---------------------------
 const CYCLES_PER_MS_ESTIMATE: u32 = 16_000; // HSI 16 MHz (tune if needed)
 
