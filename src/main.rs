@@ -489,6 +489,132 @@ mod board {
     pub const GPIOC: u32 = GPIOC_BASE;
 }
 
+
+
+// ------------------ Privileged objects & capsules ------------------
+// Core (kernel) creates privileged objects with const-unsafe constructors.
+// Capsules hold only safe references and expose safe methods to SVC.
+static GPIO_LED1_PRIV: board::GpioPriv = unsafe { board::GpioPriv::new_privileged_const(board::GPIOA, 5) };
+static GPIO_LED2_PRIV: board::GpioPriv = unsafe { board::GpioPriv::new_privileged_const(board::GPIOA, 5) };
+pub(crate) static GPIO_CAP: capsules::MuxGpio = capsules::MuxGpio::new(&GPIO_LED1_PRIV, &GPIO_LED2_PRIV);
+
+// --------------------------- Schedular (preemptive RR @ 50us) ---------------------------
+mod sched {
+    use core::arch::global_asm;
+
+    use cortex_m_rt::exception;
+
+    pub const N_TASKS: usize = 3;
+    const STACK_WORDS: usize = 256; // 1KB stack per task
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct Tcb {
+        pub sp: u32,    // Process SP for this task
+    }
+
+    // Task table (PSP contexts) and stacks
+    pub static mut TCBS: [Tcb; N_TASKS] = [Tcb { sp: 0 }; N_TASKS];
+    
+    #[repr(align(8))]
+    #[derive(Copy, Clone)]
+    struct Stack8([u32; STACK_WORDS]);
+    static mut STACKS: [Stack8; N_TASKS] = [Stack8([0; STACK_WORDS]); N_TASKS];
+    pub static mut CURR: usize = 0;
+
+     // Addresses for SCB registers (for priority+PendSV trigger)
+    const ICSR: *mut u32  = 0xE000_ED04 as *mut u32; // bit28 = PENDSVSET
+    const SHPR3:*mut u32  = 0xE000_ED20 as *mut u32; // [31:24]=SysTick, [23:16]=PendSV
+
+    unsafe extern "C" {
+    fn task0_entry() -> !;
+    fn task1_entry() -> !;
+    fn task2_entry() -> !;
+    }
+
+    #[inline(always)]
+    fn build_initial_psp(stack: &mut [u32], entry_addr: u32) -> u32 {
+        let total_words = 8 + 8; let len = stack.len(); let base = len - total_words;
+        for i in 0..8 { stack[base + i] = 0; } // r4-r11
+        // 하드웨어 프레임 (R0..R3, R12, LR, PC, xPSR)
+        stack[base + 8 + 0] = 0;                        // R0
+        stack[base + 8 + 1] = 0;                        // R1
+        stack[base + 8 + 2] = 0;                        // R2
+        stack[base + 8 + 3] = 0;                        // R3
+        stack[base + 8 + 4] = 0;                        // R12
+        stack[base + 8 + 5] = task_return_trap as u32;  // LR
+        stack[base + 8 + 6] = entry_addr as u32;        // PC
+        stack[base + 8 + 7] = 0x0100_0000;              // xPSR (T-bit)
+        (stack.as_ptr().wrapping_add(base)) as usize as u32
+    }
+
+    extern "C" fn task_return_trap() -> ! {
+        loop {
+            unsafe {
+                core::ptr::write_volatile(ICSR, 1 << 28);
+            }
+            cortex_m::asm::bkpt();
+        }
+    }
+
+    pub unsafe fn init_systick_50us() {
+        let mut v = unsafe { core::ptr::read_volatile(SHPR3) };
+        v &= !0xFFFF_0000;
+        v |= (0x80u32 << 24) | (0xFFu32 << 16);
+        unsafe { core::ptr::write_volatile(SHPR3, v) };
+
+        let syst_csr  = 0xE000_E010 as *mut u32;
+        let syst_rvr  = 0xE000_E014 as *mut u32;
+        let syst_cvr  = 0xE000_E018 as *mut u32;
+
+        unsafe { core::ptr::write_volatile(syst_rvr, 799) };
+        unsafe { core::ptr::write_volatile(syst_cvr, 0) };
+        unsafe { core::ptr::write_volatile(syst_csr, (1<<2) | (1<<1) | 1) };
+    }
+
+    pub unsafe fn init_tasks() {
+        let (p0, p1, p2);
+
+        unsafe {
+            p0 = build_initial_psp(&mut STACKS[0].0, (task0_entry as usize) as u32);
+            p1 = build_initial_psp(&mut STACKS[1].0, (task1_entry as usize) as u32);
+            p2 = build_initial_psp(&mut STACKS[2].0, (task2_entry as usize) as u32);
+            TCBS[0].sp = p0; TCBS[1].sp = p1; TCBS[2].sp = p2; CURR = 0;
+        }
+    }
+
+    pub fn start() -> ! {
+        unsafe {
+            core::ptr::write_volatile(ICSR, 1 << 28);
+        }
+        loop { cortex_m::asm::wfi(); }
+    }
+
+    global_asm!(
+        r#"
+        .global PendSV
+        .type   PendSV, %function
+    PendSV:
+        mrs     r0, psp
+        stmdb   r0!, {{r4-r11}}
+        bl      {switch}
+        ldmia   r0!, {{r4-r11}}
+        msr     psp, r0
+        bx      lr
+    "#
+
+    , switch = sym crate::sched::pend_sv_switch_rust
+    );
+
+    pub extern "C" fn pend_sv_switch_rust(old_psp: u32) -> u32 {
+        unsafe { TCBS[CURR].sp = old_psp; CURR = (CURR + 1) % N_TASKS; TCBS[CURR].sp }
+    }
+
+    #[exception]
+    fn SysTick() { unsafe { core::ptr::write_volatile(ICSR, 1 << 28); } }
+}
+
+
 // --------------------------- main ---------------------------
 const CYCLES_PER_MS_ESTIMATE: u32 = 16_000; // HSI 16 MHz (tune if needed)
 
