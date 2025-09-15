@@ -11,6 +11,8 @@ use rtt_target::{rprintln, rtt_init_print};
 
 
 // ------------------------- Capsules (no unsafe) ------------------------
+// In Tock-style, capsules virtualize/mediate privileged access.
+// So, no unsafe code here so that only the core kernel (board) can use it
 mod capsules {
     #![forbid(unsafe_code)]
     use crate::{board, os::GpioPin};
