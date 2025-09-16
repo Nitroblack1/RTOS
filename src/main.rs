@@ -429,8 +429,9 @@ mod sched {
 
     #[inline(always)]
     fn build_initial_psp(stack: &mut [u32], entry_addr: u32) -> u32 {
-        let total_words = 8 + 8; let len = stack.len(); let base = len - total_words;
-        for i in 0..8 { stack[base + i] = 0; } // r4-r11
+        let len = stack.len(); 
+        let base = len - 8; // HW frame: R0..R3, R12, LR, PC, xPSR
+        
         // 하드웨어 프레임 (R0..R3, R12, LR, PC, xPSR)
         stack[base + 8 + 0] = 0;                        // R0
         stack[base + 8 + 1] = 0;                        // R1
@@ -440,7 +441,9 @@ mod sched {
         stack[base + 8 + 5] = task_return_trap as u32;  // LR
         stack[base + 8 + 6] = entry_addr as u32;        // PC
         stack[base + 8 + 7] = 0x0100_0000;              // xPSR (T-bit)
-        (stack.as_ptr().wrapping_add(base)) as usize as u32
+
+        // 초기 PSP 반환
+        unsafe { stack.as_ptr().add(base) as usize as u32 }
     }
 
     extern "C" fn task_return_trap() -> ! {
