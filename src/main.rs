@@ -488,41 +488,55 @@ mod sched {
 
     global_asm!(
         r#"
-        .global PendSV
-        .type   PendSV, %function
-    PendSV:
-        mrs     r0, psp
-        stmdb   r0!, {{r4-r11}}
-        bl      {switch}
-        ldmia   r0!, {{r4-r11}}
-        msr     psp, r0
+            .global PendSV
+            .type   PendSV, %function
+        PendSV:
+            mrs     r0, psp
+            cbz     r0, 1f               // PSP==0이면 첫 스위치 경로로
 
-        mrs     r1, CONTROL
-        orr     r1, r1, #2      // SPSEL=1(PSP)
-        orr     r1, r1, #1      // nPRIV=1(Unpriviledged)
-        msr     CONTROL, r1
-        isb
+            // ---- 일반 스위치 경로 ----
+            stmdb   r0!, {{r4-r11}}      // 기존 태스크 r4-r11 저장
+            bl      {switch}             // r0 <- 다음 태스크 PSP (r4-r11 시작 위치)
+            ldmia   r0!, {{r4-r11}}      // 새 태스크 r4-r11 복원
+            msr     psp, r0              // PSP를 HW 프레임 시작으로
+            bx      lr
 
-        bx      lr
-    "#
+        1:
+            // ---- 첫 스위치 경로 (저장 생략) ----
+            bl      {switch}             // r0 <- task0 초기 PSP (r4-r11 시작)
+            ldmia   r0!, {{r4-r11}}      // (우리가 0으로 채워둔 r4-r11)
+            msr     psp, r0              // PSP를 HW 프레임 시작으로
 
-    , switch = sym crate::sched::pend_sv_switch_rust
+            // Thread로 복귀하기 전에 PSP/비특권 전환 1회만 수행
+            mrs     r1, CONTROL
+            orr     r1, r1, #2           // SPSEL=1 (Thread uses PSP)
+            orr     r1, r1, #1           // nPRIV=1 (Unprivileged)
+            msr     CONTROL, r1
+            isb
+        
+            // EXC_RETURN: return to Thread mode, use PSP, non-floating point
+            ldr     lr, =0xFFFFFFFD
+
+            bx      lr
+        "#
+        , switch = sym crate::sched::pend_sv_switch_rust
     );
 
+
     pub extern "C" fn pend_sv_switch_rust(old_psp: u32) -> u32 {
-        unsafe { TCBS[CURR].sp = old_psp; CURR = (CURR + 1) % N_TASKS; TCBS[CURR].sp }
+        unsafe { 
+            if old_psp != 0 {
+                // 기존 태스크의 SP 저장, 다음 태스크로 전환
+                TCBS[CURR].sp = old_psp; 
+                CURR = (CURR + 1) % N_TASKS;
+            }
+            // r0에 다음 태스크의 SP 반환
+            TCBS[CURR].sp
+        }
     }
 
     #[exception]
     fn SysTick() { unsafe { core::ptr::write_volatile(ICSR, 1 << 28); } }
-}
-
-
-use crate::os::Syscalls;
-static mut SYSCALLS_PTR: *mut svc::Client = core::ptr::null_mut();
-#[inline(always)]
-fn syscalls() -> &'static mut svc::Client {
-    unsafe { &mut *SYSCALLS_PTR }
 }
 
 // --------------------------- Tasks ---------------------------
@@ -562,6 +576,7 @@ pub extern "C" fn task2_entry() -> ! {
 
 
 // --------------------------- main ---------------------------
+use crate::os::Syscalls;
 const CYCLES_PER_MS_ESTIMATE: u32 = 16_000; // HSI 16 MHz (tune if needed)
 
 // --- Unpriviledged Thread + PSP 전환용 유저 스택 (8바이트 정렬) ---
@@ -570,7 +585,11 @@ const STACK_BYTES: usize = 2048;
 struct UserStack([u8; 2048]);
 static mut USER_STACK: UserStack = UserStack([0; STACK_BYTES]);  // size can be adjusted
 
-
+static mut SYSCALLS_PTR: *mut svc::Client = core::ptr::null_mut();
+#[inline(always)]
+fn syscalls() -> &'static mut svc::Client {
+    unsafe { &mut *SYSCALLS_PTR }
+}
 
 #[inline(always)]
 pub(crate) fn is_unpriv_thread() -> bool {
@@ -601,7 +620,7 @@ fn main() -> ! {
     // Map both logical LEDs to PA5 for visibility; button is PC13.
     let mut board = board::BoardSyscalls::new(
         board::RawPin::new(board::GPIOA, 5),  // Led1 → PA5
-        board::RawPin::new(board::GPIOA, 5),  // Led2 → PA5
+        board::RawPin::new(board::GPIOA, 6),  // Led2 → PA6
         board::RawPin::new(board::GPIOC, 13), // Btn  → PC13
         CYCLES_PER_MS_ESTIMATE,
     );
@@ -615,15 +634,6 @@ fn main() -> ! {
     // Syscalls 클라이언트 생성
     let mut syscalls = unsafe { svc::Client::new(&mut board) };
     unsafe { SYSCALLS_PTR = &mut syscalls as *mut _; }
-    
-    // // Two apps: 0 = heartbeat, 1 = SOS
-    // let mut app_beat = apps::HeartbeatApp::new(3);
-    // let mut app_sos  = apps::LedSosApp::new();
-    // let mut app_list: [&mut dyn os::App; 2] = [ &mut app_beat, &mut app_sos ];
-
-    // let mut kernel = os::Os::new(&mut app_list, &mut syscalls);
-    // // Button not pressed => heartbeat; pressed => SOS
-    // kernel.run(os::AppCall::All);
 
     unsafe {
         sched::init_tasks();
