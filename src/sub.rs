@@ -1,255 +1,165 @@
-// mini_os_app_framework.rs (Button-controlled app switching, STM32F446)
-// - Board: STM32F446 (e.g., Nucleo-F446RE)
-// - LEDs: Map BOTH logical LEDs to PA5 (LD2) so everything is visible.
-// - Button: Use user button B1 on PC13 with pull-up; pressed = LOW.
-// - Clock: assume HSI 16 MHz; adjust CYCLES_PER_MS_ESTIMATE as needed.
+// mini_os_app_framework.rs
 #![no_std]
 #![no_main]
 #![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(non_snake_case)]
-
 
 use cortex_m_rt::entry;
 use panic_halt as _;
 use rtt_target::{rprintln, rtt_init_print};
+use cortex_m::asm::nop;
 
-// ------------------------- OS Core -------------------------
-mod os {
-    #[derive(Copy, Clone, Debug)]
-    pub enum GpioPin { Led1, Led2 }
+const CYCLES_PER_MS_ESTIMATE: u32 = 16_000;
 
-    pub trait Syscalls {
-        fn gpio_write(&mut self, pin: GpioPin, high: bool);
-        fn gpio_toggle(&mut self, pin: GpioPin);
-        fn sleep_ms(&mut self, ms: u32);
-        fn now_ms(&self) -> u64;
-        fn user_button_pressed(&self) -> bool; // ← Board input exposed as a syscall
-    }
+#[derive(Copy, Clone, Debug)]
+pub enum GpioPin {
+    Led1,
+    Led2,
+}
 
-    pub trait App {
-        fn name(&self) -> &'static str;
-        fn init(&mut self, _sys: &mut dyn Syscalls) {}
-        fn tick(&mut self, sys: &mut dyn Syscalls);
-    }
+pub trait Syscalls {
+    fn gpio_write(&mut self, pin: GpioPin, high: bool);
+    fn gpio_toggle(&mut self, pin: GpioPin);
+    fn sleep_ms(&mut self, ms: u32);
+    fn now_ms(&self) -> u64;
+}
 
-    pub enum AppCall<'a> {
-        ByName(&'a str),
-        ByIndex(usize),
-        All,
-        /// Run `primary` app while button is released; run `secondary` while pressed.
-        SwitchOnButton { primary: usize, secondary: usize },
-    }
-
-    pub struct Os<'a> {
-        apps: &'a mut [&'a mut dyn App],
-        sys: &'a mut dyn Syscalls,
-        started: bool,
-    }
-
-    impl<'a> Os<'a> {
-        pub fn new(apps: &'a mut [&'a mut dyn App], sys: &'a mut dyn Syscalls) -> Self {
-            Self { apps, sys, started: false }
-        }
-        pub fn run(&'a mut self, call: AppCall<'a>) -> ! {
-            // One-time init for all apps
-            if !self.started { for a in self.apps.iter_mut() { a.init(self.sys); } self.started = true; }
-
-            assert!(!self.apps.is_empty(), "no apps to run");
-
-            match call {
-                AppCall::ByIndex(mut i) => {
-                    i %= self.apps.len();
-                    loop { self.apps[i].tick(self.sys); }
-                }
-                AppCall::ByName(name) => {
-                    let mut idx = 0usize;
-                    for (i, a) in self.apps.iter().enumerate() { if a.name() == name { idx = i; break; } }
-                    loop { self.apps[idx].tick(self.sys); }
-                }
-                AppCall::All => {
-                    loop { for a in self.apps.iter_mut() { a.tick(self.sys); } }
-                }
-                AppCall::SwitchOnButton { mut primary, mut secondary } => {
-                    let len = self.apps.len();
-                    primary %= len; secondary %= len;
-                    loop {
-                        if self.sys.user_button_pressed() {
-                            self.apps[secondary].tick(self.sys);
-                        } else {
-                            self.apps[primary].tick(self.sys);
-                        }
-                        self.sys.sleep_ms(1); // debounce / cooperative yield
-                    }
-                }
-            }
-        }
+#[inline(always)]
+fn gpio_pin_to_idx(pin: GpioPin) -> u32 {
+    match pin {
+        GpioPin::Led1 => 0,
+        GpioPin::Led2 => 1,
     }
 }
 
-// ------------------------- Apps ----------------------------
-mod apps {
-    use super::os::{App, GpioPin, Syscalls};
+// ───────────── BOARD LAYER ─────────────
 
-    /// Heartbeat: steady blink on PA5 (both Led1/Led2 mapped) to show liveness.
-    pub struct HeartbeatApp { last: u64, on: bool, period_ms: u32 }
-    impl HeartbeatApp { pub const fn new(period_ms: u32) -> Self { Self { last: 0, on: false, period_ms } } }
-    impl App for HeartbeatApp {
-        fn name(&self) -> &'static str { "heartbeat" }
-        fn tick(&mut self, sys: &mut dyn Syscalls) {
-            let now = sys.now_ms();
-            if now.wrapping_sub(self.last) >= self.period_ms as u64 {
-                self.on = !self.on;
-                sys.gpio_write(GpioPin::Led1, self.on);
-                sys.gpio_write(GpioPin::Led2, self.on);
-                self.last = now;
-            }
-            sys.sleep_ms(1);
-        }
-    }
-
-    /// SOS pattern on PA5: ··· ––– ···, repeats
-    pub struct LedSosApp;
-    impl LedSosApp { pub const fn new() -> Self { Self } }
-    impl App for LedSosApp {
-        fn name(&self) -> &'static str { "led_sos" }
-        fn tick(&mut self, sys: &mut dyn Syscalls) {
-            const DOT: u32 = 2; const DASH: u32 = 6; const GAP: u32 = 2; const WORD: u32 = 7;
-            let mut pulse = |dur: u32| {
-                sys.gpio_write(GpioPin::Led2, true);  sys.sleep_ms(dur);
-                sys.gpio_write(GpioPin::Led2, false); sys.sleep_ms(GAP);
-            };
-            for _ in 0..2 { pulse(DOT); }
-            for _ in 0..2 { pulse(DASH); }
-            for _ in 0..2 { pulse(DOT); }
-            sys.sleep_ms(WORD);
-        }
-    }
-
-}
-
-// -------------- Board layer: STM32F446 raw registers ---------
 mod board {
     use core::ptr::{read_volatile, write_volatile};
-    use super::os::{GpioPin, Syscalls};
+    use crate::{GpioPin, Syscalls};
     use cortex_m::asm::nop;
 
-    // --- RCC base (STM32F4xx) ---
     const RCC_BASE: u32 = 0x4002_3800;
-    const RCC_AHB1ENR: *mut u32 = (RCC_BASE + 0x30) as *mut u32; // GPIOxEN bits
+    const RCC_AHB1ENR: *mut u32 = (RCC_BASE + 0x30) as *mut u32;
 
-    // --- GPIO base ---
     pub const GPIOA_BASE: u32 = 0x4002_0000;
     pub const GPIOC_BASE: u32 = 0x4002_0800;
 
-    // Offsets (only what we use)
-    const MODER_OFF:  u32 = 0x00;
+    const MODER_OFF: u32 = 0x00;
     const OTYPER_OFF: u32 = 0x04;
-    const PUPDR_OFF:  u32 = 0x0C;
-    const IDR_OFF:    u32 = 0x10;
-    const ODR_OFF:    u32 = 0x14;
-    const BSRR_OFF:   u32 = 0x18;
+    const PUPDR_OFF: u32 = 0x0C;
+    const IDR_OFF: u32 = 0x10;
+    const ODR_OFF: u32 = 0x14;
+    const BSRR_OFF: u32 = 0x18;
 
     #[inline(always)]
-    const fn reg32(addr: u32) -> *mut u32 { addr as *mut u32 }
+    const fn reg32(addr: u32) -> *mut u32 {
+        addr as *mut u32
+    }
 
     unsafe fn gpio_enable_clock(port_base: u32) {
-        // AHB1ENR: bit0=GPIOA, bit2=GPIOC
-        let bit = match port_base { GPIOA_BASE => 0, GPIOC_BASE => 2, _ => unreachable!() };
-        let mut v = unsafe { read_volatile(RCC_AHB1ENR) };
+        let bit = match port_base {
+            GPIOA_BASE => 0,
+            GPIOC_BASE => 2,
+            _ => unreachable!(),
+        };
+        let mut v = read_volatile(RCC_AHB1ENR);
         v |= 1 << bit;
-        unsafe { write_volatile(RCC_AHB1ENR, v) };
-        for _ in 0..128 { nop(); }
+        write_volatile(RCC_AHB1ENR, v);
+        for _ in 0..128 {
+            nop();
+        }
     }
 
     unsafe fn gpio_set_output(port_base: u32, pin: u8) {
-        // MODER: 01 = output
-        let moder = reg32(port_base + MODER_OFF);
-        let mut v = unsafe { read_volatile(moder) };
         let shift = (pin as u32) * 2;
+
+        let moder = reg32(port_base + MODER_OFF);
+        let mut v = read_volatile(moder);
         v &= !(0b11 << shift);
-        v |=  0b01 << shift;
-        unsafe { write_volatile(moder, v) };
+        v |= 0b01 << shift;
+        write_volatile(moder, v);
 
-        // OTYPER: push-pull
         let otyper = reg32(port_base + OTYPER_OFF);
-        let mut v = unsafe { read_volatile(otyper) };
+        let mut v = read_volatile(otyper);
         v &= !(1 << pin);
-        unsafe { write_volatile(otyper, v) };
+        write_volatile(otyper, v);
 
-        // PUPDR: no pull
         let pupdr = reg32(port_base + PUPDR_OFF);
-        let mut v = unsafe { read_volatile(pupdr) };
-        let shift2 = (pin as u32) * 2;
-        v &= !(0b11 << shift2);
-        unsafe { write_volatile(pupdr, v) };
+        let mut v = read_volatile(pupdr);
+        v &= !(0b11 << shift);
+        write_volatile(pupdr, v);
     }
 
     unsafe fn gpio_set_input_pullup(port_base: u32, pin: u8) {
-        // MODER: 00 = input
-        let moder = reg32(port_base + MODER_OFF);
-        let mut v = unsafe { read_volatile(moder) };
         let shift = (pin as u32) * 2;
-        v &= !(0b11 << shift);
-        unsafe { write_volatile(moder, v) };
 
-        // PUPDR: 01 = pull-up
-        let pupdr = reg32(port_base + PUPDR_OFF);
-        let mut v = unsafe { read_volatile(pupdr) };
+        let moder = reg32(port_base + MODER_OFF);
+        let mut v = read_volatile(moder);
         v &= !(0b11 << shift);
-        v |=  0b01 << shift;
-        unsafe { write_volatile(pupdr, v) };
+        write_volatile(moder, v);
+
+        let pupdr = reg32(port_base + PUPDR_OFF);
+        let mut v = read_volatile(pupdr);
+        v &= !(0b11 << shift);
+        v |= 0b01 << shift;
+        write_volatile(pupdr, v);
     }
 
     unsafe fn gpio_write(port_base: u32, pin: u8, high: bool) {
         let bsrr = reg32(port_base + BSRR_OFF);
         let val = if high { 1u32 << pin } else { 1u32 << (pin + 16) };
-        unsafe { write_volatile(bsrr, val) };
+        write_volatile(bsrr, val);
     }
 
     unsafe fn gpio_toggle(port_base: u32, pin: u8) {
         let odr = reg32(port_base + ODR_OFF);
-        let cur = unsafe { read_volatile(odr) };
-        let high = ((cur >> pin) & 1) == 0;
-        unsafe { gpio_write(port_base, pin, high) };
+        let cur = read_volatile(odr);
+        gpio_write(port_base, pin, ((cur >> pin) & 1) == 0);
     }
 
-    unsafe fn gpio_read_input(port_base: u32, pin: u8) -> bool {
-        let idr = reg32(port_base + IDR_OFF);
-        let v = unsafe { read_volatile(idr) };
-        ((v >> pin) & 1) != 0
+    pub struct RawPin {
+        pub(crate) port_base: u32,
+        pub(crate) pin: u8,
     }
 
-    pub struct RawPin { pub(crate) port_base: u32, pub(crate) pin: u8 }
-    impl RawPin { pub const fn new(port_base: u32, pin: u8) -> Self { Self { port_base, pin } } }
+    impl RawPin {
+        pub const fn new(port_base: u32, pin: u8) -> Self {
+            Self { port_base, pin }
+        }
+    }
 
     pub struct BoardSyscalls {
-        led1: RawPin, // PA5
-        led2: RawPin, // PA5
-        btn:  RawPin, // PC13
+        led1: RawPin,
+        led2: RawPin,
+        btn: RawPin,
         time_ms: u64,
         cycles_per_ms: u32,
     }
 
     impl BoardSyscalls {
         pub const fn new(led1: RawPin, led2: RawPin, btn: RawPin, cycles_per_ms: u32) -> Self {
-            Self { led1, led2, btn, time_ms: 0, cycles_per_ms }
+            Self {
+                led1,
+                led2,
+                btn,
+                time_ms: 0,
+                cycles_per_ms,
+            }
         }
 
         pub unsafe fn init(&mut self) {
-            unsafe {
-                gpio_enable_clock(GPIOA_BASE);
-                gpio_enable_clock(GPIOC_BASE);
-                gpio_set_output(self.led1.port_base, self.led1.pin);
-                gpio_set_output(self.led2.port_base, self.led2.pin);
-                gpio_set_input_pullup(self.btn.port_base, self.btn.pin);
-            }
+            gpio_enable_clock(GPIOA_BASE);
+            gpio_enable_clock(GPIOC_BASE);
+            gpio_set_output(self.led1.port_base, self.led1.pin);
+            gpio_set_output(self.led2.port_base, self.led2.pin);
+            gpio_set_input_pullup(self.btn.port_base, self.btn.pin);
         }
 
         fn spin_delay(&mut self, ms: u32) {
             for _ in 0..ms {
-                for _ in 0..self.cycles_per_ms { nop(); }
+                for _ in 0..self.cycles_per_ms {
+                    nop();
+                }
                 self.time_ms = self.time_ms.wrapping_add(1);
             }
         }
@@ -264,6 +174,7 @@ mod board {
                 }
             }
         }
+
         fn gpio_toggle(&mut self, pin: GpioPin) {
             unsafe {
                 match pin {
@@ -272,14 +183,34 @@ mod board {
                 }
             }
         }
-        fn sleep_ms(&mut self, ms: u32) { self.spin_delay(ms); }
-        fn now_ms(&self) -> u64 { self.time_ms }
-        fn user_button_pressed(&self) -> bool {
-            unsafe {
-                // B1 on Nucleo-F446RE (PC13): pull-up. Pressed => level LOW.
-                let high = gpio_read_input(self.btn.port_base, self.btn.pin);
-                !high
-            }
+
+        fn sleep_ms(&mut self, ms: u32) {
+            self.spin_delay(ms);
+        }
+
+        fn now_ms(&self) -> u64 {
+            self.time_ms
+        }
+    }
+
+    pub struct GpioPriv {
+        pub(crate) port_base: u32,
+        pub(crate) pin: u8,
+    }
+
+    impl GpioPriv {
+        pub const unsafe fn new_privileged_const(port_base: u32, pin: u8) -> Self {
+            Self { port_base, pin }
+        }
+
+        #[inline]
+        pub fn write(&self, high: bool) {
+            unsafe { gpio_write(self.port_base, self.pin, high) };
+        }
+
+        #[inline]
+        pub fn toggle(&self) {
+            unsafe { gpio_toggle(self.port_base, self.pin) };
         }
     }
 
@@ -287,31 +218,388 @@ mod board {
     pub const GPIOC: u32 = GPIOC_BASE;
 }
 
-// --------------------------- main ---------------------------
-const CYCLES_PER_MS_ESTIMATE: u32 = 16_000; // HSI 16 MHz (tune if needed)
+// ───────────── CAPSULES ─────────────
+mod capsules {
+    #![forbid(unsafe_code)]
+
+    use crate::{board, GpioPin};
+
+    pub struct MuxGpio {
+        led1: &'static board::GpioPriv,
+        led2: &'static board::GpioPriv,
+    }
+
+    impl MuxGpio {
+        pub const fn new(led1: &'static board::GpioPriv, led2: &'static board::GpioPriv) -> Self {
+            Self { led1, led2 }
+        }
+
+        #[inline]
+        pub fn write(&self, pin: GpioPin, high: bool) {
+            match pin {
+                GpioPin::Led1 => self.led1.write(high),
+                GpioPin::Led2 => self.led2.write(high),
+            }
+        }
+
+        pub fn toggle(&self, pin: GpioPin) {
+            match pin {
+                GpioPin::Led1 => self.led1.toggle(),
+                GpioPin::Led2 => self.led2.toggle(),
+            }
+        }
+    }
+}
+
+// ───────────── SVC ─────────────
+mod svc {
+    use core::arch::{asm, global_asm};
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::{GpioPin, Syscalls, gpio_pin_to_idx};
+
+    pub mod abi {
+        pub const NOW_MS: u8 = 1;
+        pub const GPIO_WRITE: u8 = 2;
+        pub const GPIO_TOGGLE: u8 = 3;
+        pub const SLEEP_MS: u8 = 4;
+    }
+
+    #[inline(always)]
+    pub fn svc_call(call_id: u8, a0: u32, a1: u32, a2: u32, a3: u32) -> u32 {
+        let mut r0 = call_id as u32;
+        unsafe {
+            asm!(
+                "svc 0",
+                inlateout("r0") r0,
+                in("r1") a0,
+                in("r2") a1,
+                in("r3") a2,
+                in("r12") a3,
+                options(nostack)
+            );
+        }
+        r0
+    }
+
+    static SVC_COUNTER: AtomicU32 = AtomicU32::new(0);
+    static NOW_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    pub fn svc_stats() -> (u32, u32) {
+        (
+            SVC_COUNTER.load(Ordering::Relaxed),
+            NOW_COUNT.load(Ordering::Relaxed),
+        )
+    }
+
+    #[repr(C)]
+    pub struct ExceptionFrame {
+        pub r0: u32,
+        pub r1: u32,
+        pub r2: u32,
+        pub r3: u32,
+        pub r12: u32,
+        pub lr: u32,
+        pub pc: u32,
+        pub xpsr: u32,
+    }
+
+    global_asm!(
+        r#"
+        .global SVCall
+        .type   SVCall, %function
+    SVCall:
+        tst     lr, #4
+        ite     eq
+        mrseq   r0, msp
+        mrsne   r0, psp
+        b       {svcrust}
+    "#,
+        svcrust = sym svcall_rust
+    );
+
+    extern "C" fn svcall_rust(frame: &mut ExceptionFrame) {
+        let call_id = (frame.r0 & 0xFF) as u8;
+        SVC_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if call_id == abi::NOW_MS {
+            NOW_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let ret = unsafe {
+            kernel_dispatch(call_id, frame.r1, frame.r2, frame.r3, frame.r12)
+        };
+        frame.r0 = ret;
+    }
+
+    static mut BOARD_PTR: *mut crate::board::BoardSyscalls = core::ptr::null_mut();
+
+    pub unsafe fn register_kernel_board(p: *mut crate::board::BoardSyscalls) {
+        BOARD_PTR = p;
+    }
+
+    unsafe fn kernel_dispatch(call_id: u8, a0: u32, a1: u32, _a2: u32, _a3: u32) -> u32 {
+        let board = &mut *BOARD_PTR;
+        match call_id {
+            abi::NOW_MS => board.now_ms() as u32,
+            abi::GPIO_WRITE => {
+                let pin = if a0 == 0 { GpioPin::Led1 } else { GpioPin::Led2 };
+                board.gpio_write(pin, a1 != 0);
+                0
+            }
+            abi::GPIO_TOGGLE => {
+                let pin = if a0 == 0 { GpioPin::Led1 } else { GpioPin::Led2 };
+                board.gpio_toggle(pin);
+                0
+            }
+            abi::SLEEP_MS => {
+                board.sleep_ms(a0);
+                0
+            }
+            _ => 0xFFFF_FFFF,
+        }
+    }
+
+    pub struct Client {
+        board: *mut crate::board::BoardSyscalls,
+    }
+
+    impl Client {
+        pub unsafe fn new(board: &mut crate::board::BoardSyscalls) -> Self {
+            Self { board: board as *mut _ }
+        }
+    }
+
+    impl Syscalls for Client {
+        fn now_ms(&self) -> u64 {
+            svc_call(abi::NOW_MS, 0, 0, 0, 0) as u64
+        }
+
+        fn sleep_ms(&mut self, ms: u32) {
+            let _ = svc_call(abi::SLEEP_MS, ms, 0, 0, 0);
+        }
+
+        fn gpio_write(&mut self, pin: GpioPin, high: bool) {
+            let _ = svc_call(abi::GPIO_WRITE, gpio_pin_to_idx(pin), high as u32, 0, 0);
+        }
+
+        fn gpio_toggle(&mut self, pin: GpioPin) {
+            let _ = svc_call(abi::GPIO_TOGGLE, gpio_pin_to_idx(pin), 0, 0, 0);
+        }
+    }
+}
+
+// ───────────── SCHEDULER & TASKS ─────────────
+
+mod sched {
+    use cortex_m_rt::exception;
+    use core::arch::global_asm;
+    use crate::{task0_entry, task1_entry, task2_entry};
+    use rtt_target::rprintln;
+
+    pub const N_TASKS: usize = 3;
+    const STACK_WORDS: usize = 256;
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct Tcb {
+        pub sp: u32,
+    }
+
+    #[repr(align(8))]
+    #[derive(Copy, Clone)]
+    struct Stack8([u32; STACK_WORDS]);
+
+    static mut TCBS: [Tcb; N_TASKS] = [Tcb { sp: 0 }; N_TASKS];
+    static mut STACKS: [Stack8; N_TASKS] = [Stack8([0; STACK_WORDS]); N_TASKS];
+    static mut CURR: usize = 0;
+
+    const ICSR: *mut u32 = 0xE000_ED04 as *mut u32;
+    const SHPR3: *mut u32 = 0xE000_ED20 as *mut u32;
+
+    #[inline(always)]
+    fn build_initial_psp(stack: &mut [u32], entry: usize) -> u32 {
+        const SW: usize = 8;
+        const HW: usize = 8;
+        const GUARD: usize = 8;
+
+        let len = stack.len();
+        let base = len - (SW + HW + GUARD);
+
+        for i in 0..SW {
+            stack[base + i] = 0;
+        }
+
+        let hw = base + SW;
+        stack[hw + 0] = 0;
+        stack[hw + 1] = 0;
+        stack[hw + 2] = 0;
+        stack[hw + 3] = 0;
+        stack[hw + 4] = 0;
+        stack[hw + 5] = (task_return_trap as u32) | 1;
+        stack[hw + 6] = (entry as u32) | 1;
+        stack[hw + 7] = 0x0100_0000;
+
+        let psp = unsafe { stack.as_ptr().add(base) as u32 };
+        assert!(psp & 7 == 0);
+        psp
+    }
+
+    extern "C" fn task_return_trap() -> ! {
+        loop {
+            unsafe { core::ptr::write_volatile(ICSR, 1 << 28); }
+        }
+    }
+
+    pub unsafe fn init_tasks() {
+        let p0 = build_initial_psp(&mut STACKS[0].0, task0_entry as usize);
+        let p1 = build_initial_psp(&mut STACKS[1].0, task1_entry as usize);
+        let p2 = build_initial_psp(&mut STACKS[2].0, task2_entry as usize);
+
+        TCBS[0].sp = p0;
+        TCBS[1].sp = p1;
+        TCBS[2].sp = p2;
+        CURR = 0;
+
+        rprintln!("p0=0x{:08X} p1=0x{:08X} p2=0x{:08X}", p0, p1, p2);
+    }
+
+    pub unsafe fn init_systick_50us() {
+        let mut v = core::ptr::read_volatile(SHPR3);
+        v &= !0xFFFF_0000;
+        v |= (0x80u32 << 24) | (0xFFu32 << 16);
+        core::ptr::write_volatile(SHPR3, v);
+
+        let syst_csr = 0xE000_E010 as *mut u32;
+        let syst_rvr = 0xE000_E014 as *mut u32;
+        let syst_cvr = 0xE000_E018 as *mut u32;
+
+        core::ptr::write_volatile(syst_rvr, 799);
+        core::ptr::write_volatile(syst_cvr, 0);
+        core::ptr::write_volatile(syst_csr, (1 << 2) | (1 << 1) | 1);
+    }
+
+    pub fn start() -> ! {
+        rprintln!("Starting scheduler...");
+        unsafe {
+            core::ptr::write_volatile(ICSR, 1 << 28);
+        }
+        loop {
+            cortex_m::asm::wfi();
+        }
+    }
+
+    global_asm!(
+        r#"
+        .global PendSV
+        .type PendSV, %function
+    PendSV:
+        mrs     r0, psp
+        cbz     r0, 1f
+        stmdb   r0!, {r4-r11}
+        bl      {switch}
+        ldmia   r0!, {r4-r11}
+        msr     psp, r0
+        bx      lr
+
+    1:
+        bl      {switch}
+        ldmia   r0!, {r4-r11}
+        msr     psp, r0
+        mrs     r1, CONTROL
+        orr     r1, r1, #2
+        orr     r1, r1, #1
+        msr     CONTROL, r1
+        isb
+        ldr     lr, =0xFFFFFFFD
+        bx      lr
+    "#,
+        switch = sym pend_sv_switch_rust
+    );
+
+    pub extern "C" fn pend_sv_switch_rust(old_psp: u32) -> u32 {
+        unsafe {
+            if old_psp != 0 {
+                TCBS[CURR].sp = old_psp;
+                CURR = (CURR + 1) % N_TASKS;
+            }
+            TCBS[CURR].sp
+        }
+    }
+
+    #[exception]
+    fn SysTick() {
+        unsafe { core::ptr::write_volatile(ICSR, 1 << 28); }
+    }
+}
+
+// ───────────── TASKS ─────────────
+
+#[no_mangle]
+pub extern "C" fn task0_entry() -> ! {
+    loop {
+        syscalls().gpio_toggle(GpioPin::Led1);
+        for _ in 0..300 {
+            cortex_m::asm::nop();
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn task1_entry() -> ! {
+    loop {
+        syscalls().gpio_toggle(GpioPin::Led2);
+        for _ in 0..800 {
+            cortex_m::asm::nop();
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn task2_entry() -> ! {
+    static mut LAST: u64 = 0;
+    loop {
+        let now = syscalls().now_ms();
+        unsafe {
+            if now.wrapping_sub(LAST) >= 1000 {
+                LAST = now;
+            }
+        }
+        for _ in 0..1200 {
+            cortex_m::asm::nop();
+        }
+    }
+}
+
+// ───────────── MAIN ENTRY ─────────────
+
+static mut SYSCALLS_PTR: *mut svc::Client = core::ptr::null_mut();
+
+#[inline(always)]
+fn syscalls() -> &'static mut svc::Client {
+    unsafe { &mut *SYSCALLS_PTR }
+}
 
 #[entry]
 fn main() -> ! {
     rtt_init_print!();
-    rprintln!("[mini-os] booting (button-controlled switching)");
+    rprintln!("[mini-os] Booting");
 
-    // Map both logical LEDs to PA5 for visibility; button is PC13.
-    let mut syscalls = board::BoardSyscalls::new(
-        board::RawPin::new(board::GPIOA, 5),  // Led1 → PA5
-        board::RawPin::new(board::GPIOA, 5),  // Led2 → PA5
-        board::RawPin::new(board::GPIOC, 13), // Btn  → PC13
+    let mut board = board::BoardSyscalls::new(
+        board::RawPin::new(board::GPIOA, 5),
+        board::RawPin::new(board::GPIOA, 6),
+        board::RawPin::new(board::GPIOC, 13),
         CYCLES_PER_MS_ESTIMATE,
     );
 
-    unsafe { syscalls.init(); }
-    rprintln!("GPIO ready: PA5 output, PC13 input-pullup");
+    unsafe {
+        board.init();
+        svc::register_kernel_board(&mut board);
+        let mut client = svc::Client::new(&mut board);
+        SYSCALLS_PTR = &mut client;
 
-    // Two apps: 0 = heartbeat, 1 = SOS
-    let mut app_beat = apps::HeartbeatApp::new(3);
-    let mut app_sos  = apps::LedSosApp::new();
-    let mut app_list: [&mut dyn os::App; 2] = [ &mut app_beat, &mut app_sos ];
+        sched::init_tasks();
+        sched::init_systick_50us();
+    }
 
-    let mut kernel = os::Os::new(&mut app_list, &mut syscalls);
-    // Button not pressed => heartbeat; pressed => SOS
-    kernel.run(os::AppCall::SwitchOnButton { primary: 0, secondary: 1 })
+    sched::start();
 }
