@@ -34,6 +34,7 @@ mod board {
     use core::ptr::{read_volatile, write_volatile};
     use crate::{GpioPin, Syscalls};
     use cortex_m::asm::nop;
+    use rtt_target::{rprintln};
 
     const RCC_BASE: u32 = 0x4002_3800;
     const RCC_AHB1ENR: *mut u32 = (RCC_BASE + 0x30) as *mut u32;
@@ -103,6 +104,7 @@ mod board {
     }
 
     unsafe fn gpio_write(port_base: u32, pin: u8, high: bool) {
+        rprintln!("[GPIO] gpio_write called: pin={}, high={}", pin, high);
         let bsrr = reg32(port_base + BSRR_OFF);
         let val = if high { 1u32 << pin } else { 1u32 << (pin + 16) };
         unsafe { write_volatile(bsrr, val) };
@@ -246,6 +248,8 @@ mod svc {
     use core::arch::{asm, global_asm};
     use core::sync::atomic::{AtomicU32, Ordering};
 
+    use rtt_target::{rprintln};
+
     use crate::{GpioPin, Syscalls};
 
     pub mod abi {
@@ -310,6 +314,9 @@ mod svc {
 
     extern "C" fn svcall_rust(frame: &mut ExceptionFrame) {
         let call_id = (frame.r0 & 0xFF) as u8;
+
+        rprintln!("[SVC] svcall_rust called with ID: {}", call_id);
+
         SVC_COUNTER.fetch_add(1, Ordering::Relaxed);
         if call_id == abi::NOW_MS {
             NOW_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -424,8 +431,11 @@ mod sched {
         stack[hw + 3] = 0;
         stack[hw + 4] = 0;
         stack[hw + 5] = (task_return_trap as u32) | 1;
-        stack[hw + 6] = (entry as u32) | 1;
+        let pc_value = (entry as u32 & !1) | 1;
+        stack[hw + 6] = pc_value;
         stack[hw + 7] = 0x0100_0000;
+
+        rprintln!("[STACK] Entry=0x{:08X} -> PC=0x{:08X}", entry, pc_value);
 
         let psp = unsafe { stack.as_ptr().add(base) as u32 };
         assert!(psp & 7 == 0);
@@ -440,6 +450,11 @@ mod sched {
 
     pub unsafe fn init_tasks() {
         unsafe {
+            rprintln!("[INIT] Initializing tasks...");
+            rprintln!("[INIT] task0_entry=0x{:08X}", task0_entry as usize);
+            rprintln!("[INIT] task1_entry=0x{:08X}", task1_entry as usize);
+            rprintln!("[INIT] task2_entry=0x{:08X}", task2_entry as usize);
+
             let p0 = build_initial_psp(&mut STACKS[0].0, task0_entry as usize);
             let p1 = build_initial_psp(&mut STACKS[1].0, task1_entry as usize);
             let p2 = build_initial_psp(&mut STACKS[2].0, task2_entry as usize);
@@ -450,6 +465,7 @@ mod sched {
             CURR = 0;
 
             rprintln!("p0=0x{:08X} p1=0x{:08X} p2=0x{:08X}", p0, p1, p2);
+            rprintln!("[INIT] Tasks initialized, starting with task 0");
         }
     }
 
@@ -490,7 +506,7 @@ mod sched {
         ldmia   r0!, {{r4-r11}}
         msr     psp, r0
         bx      lr
-
+    
     1:
         bl      {switch}
         ldmia   r0!, {{r4-r11}}
@@ -506,18 +522,27 @@ mod sched {
         switch = sym pend_sv_switch_rust
     );
 
+
     pub extern "C" fn pend_sv_switch_rust(old_psp: u32) -> u32 {
         unsafe {
+            let current_task = core::ptr::read_volatile(core::ptr::addr_of!(CURR));
+            rprintln!("[PendSV] Context switch: old_psp=0x{:08X}, current_task={}", old_psp, current_task);
             if old_psp != 0 {
-                TCBS[CURR].sp = old_psp;
-                CURR = (CURR + 1) % N_TASKS;
+                TCBS[current_task].sp = old_psp;
+                rprintln!("[PendSV] Saved task {} SP=0x{:08X}", current_task, old_psp);
+                let next_task = (current_task + 1) % N_TASKS;
+                core::ptr::write_volatile(core::ptr::addr_of_mut!(CURR), next_task);
             }
-            TCBS[CURR].sp
+            let new_task = core::ptr::read_volatile(core::ptr::addr_of!(CURR));
+            let new_sp = TCBS[new_task].sp;
+            rprintln!("[PendSV] Switching to task {} SP=0x{:08X}", new_task, new_sp);
+            new_sp
         }
     }
 
     #[exception]
     fn SysTick() {
+        // rprintln!("[SysTick] interrupt fired");
         unsafe { core::ptr::write_volatile(ICSR, 1 << 28); }
     }
 }
@@ -527,31 +552,37 @@ mod sched {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn task0_entry() -> ! {
+    rprintln!("[TASK0] Entry point reached");
     loop {
+        rprintln!("[TASK0] About to toggle LED");
         syscalls().gpio_toggle(GpioPin::Led1);
-        for _ in 0..300 {
-            cortex_m::asm::nop();
-        }
+        rprintln!("[TASK0] About to sleep 500ms");
+        syscalls().sleep_ms(500);
+        rprintln!("[TASK0] Sleep completed");
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn task1_entry() -> ! {
+    rprintln!("[TASK1] Entry point reached");
     loop {
+        rprintln!("[TASK1] About to toggle LED");
         syscalls().gpio_toggle(GpioPin::Led1);
-        for _ in 0..800 {
-            cortex_m::asm::nop();
-        }
+        rprintln!("[TASK1] About to sleep 1000ms");
+        syscalls().sleep_ms(1000);
+        rprintln!("[TASK1] Sleep completed");
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn task2_entry() -> ! {
     static mut LAST: u64 = 0;
+    rprintln!("[TASK2] Entry point reached");
     loop {
         let now = syscalls().now_ms();
         unsafe {
             if now.wrapping_sub(LAST) >= 1000 {
+                rprintln!("[TASK2] 1000ms elapsed, now={}", now);
                 LAST = now;
             }
         }
@@ -562,12 +593,19 @@ pub extern "C" fn task2_entry() -> ! {
 }
 
 // ───────────── MAIN ENTRY ─────────────
-
+static mut BOARD: Option<board::BoardSyscalls> = None;
+static mut SYSCALL_CLIENT: Option<svc::Client> = None;
 static mut SYSCALLS_PTR: *mut svc::Client = core::ptr::null_mut();
 
 #[inline(always)]
 fn syscalls() -> &'static mut svc::Client {
-    unsafe { &mut *SYSCALLS_PTR }
+    unsafe {
+        if SYSCALLS_PTR.is_null() {
+            rprintln!("[ERROR] SYSCALLS_PTR is null!");
+            loop {}
+        }
+        &mut *SYSCALLS_PTR
+    }
 }
 
 #[entry]
@@ -575,18 +613,31 @@ fn main() -> ! {
     rtt_init_print!();
     rprintln!("[mini-os] Booting");
 
-    let mut board = board::BoardSyscalls::new(
-        board::RawPin::new(board::GPIOA, 5),
-        board::RawPin::new(board::GPIOC, 13),
-        CYCLES_PER_MS_ESTIMATE,
-    );
+    unsafe {
+        // ───── Initialize static BOARD instance ─────
+        BOARD = Some(board::BoardSyscalls::new(
+            board::RawPin::new(board::GPIOA, 5),
+            board::RawPin::new(board::GPIOC, 13),
+            CYCLES_PER_MS_ESTIMATE,
+        ));
+
+        // Extract raw pointer to BOARD
+        let board_option_ptr = core::ptr::addr_of_mut!(BOARD);
+        let board_ptr: *mut board::BoardSyscalls = (*board_option_ptr).as_mut().unwrap() as *mut _;
+
+        // Call .init() via pointer deref
+        (*board_ptr).init();
+
+        // Register with SVC
+        svc::register_kernel_board(board_ptr);
+
+        // ───── Create syscall client instance and assign to global ─────
+        SYSCALL_CLIENT = Some(svc::Client::new(&mut *board_ptr));
+        let client_option_ptr = core::ptr::addr_of_mut!(SYSCALL_CLIENT);
+        SYSCALLS_PTR = (*client_option_ptr).as_mut().unwrap() as *mut _;
+    }
 
     unsafe {
-        board.init();
-        svc::register_kernel_board(&mut board);
-        let mut client = svc::Client::new(&mut board);
-        SYSCALLS_PTR = &mut client;
-
         sched::init_tasks();
         sched::init_systick_50us();
     }
@@ -594,17 +645,3 @@ fn main() -> ! {
     sched::start();
 }
 
-////////////////////////////////////////////////////////////////////////////////////
-// #![no_std]
-// #![no_main]
-
-// mod os;
-
-// use os::os_main;
-
-// use cortex_m_rt::entry;
-
-// #[entry]
-// fn main() -> ! {
-//     os_main();
-// }
