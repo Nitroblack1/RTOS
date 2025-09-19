@@ -9,16 +9,16 @@ cortex-m-rt = "0.7.5"
 panic-halt = "1.0.0"
 rtt-target = "0.6.1"
 
-[profile.dev]
-opt-level = 2
-debug = true
-codegen-units = 1
-lto = false
-panic = "abort"
+# [profile.dev]
+# opt-level = 2
+# debug = true
+# codegen-units = 1
+# lto = false
+# panic = "abort"
 
-[profile.release]
-opt-level = 3
-debug = true
-codegen-units = 1
-lto = true
-panic = "abort"
+# [profile.release]
+# opt-level = 3
+# debug = true
+# codegen-units = 1
+# lto = true
+# panic = "abort"

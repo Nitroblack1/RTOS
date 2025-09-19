@@ -12,7 +12,6 @@ const CYCLES_PER_MS_ESTIMATE: u32 = 16_000;
 #[derive(Copy, Clone, Debug)]
 pub enum GpioPin {
     Led1,
-    Led2,
 }
 
 pub trait Syscalls {
@@ -26,7 +25,6 @@ pub trait Syscalls {
 fn gpio_pin_to_idx(pin: GpioPin) -> u32 {
     match pin {
         GpioPin::Led1 => 0,
-        GpioPin::Led2 => 1,
     }
 }
 
@@ -129,17 +127,15 @@ mod board {
 
     pub struct BoardSyscalls {
         led1: RawPin,
-        led2: RawPin,
         btn: RawPin,
         time_ms: u64,
         cycles_per_ms: u32,
     }
 
     impl BoardSyscalls {
-        pub const fn new(led1: RawPin, led2: RawPin, btn: RawPin, cycles_per_ms: u32) -> Self {
+        pub const fn new(led1: RawPin, btn: RawPin, cycles_per_ms: u32) -> Self {
             Self {
                 led1,
-                led2,
                 btn,
                 time_ms: 0,
                 cycles_per_ms,
@@ -150,7 +146,6 @@ mod board {
             unsafe { gpio_enable_clock(GPIOA_BASE); }
             unsafe { gpio_enable_clock(GPIOC_BASE); }
             unsafe { gpio_set_output(self.led1.port_base, self.led1.pin); }
-            unsafe { gpio_set_output(self.led2.port_base, self.led2.pin); }
             unsafe { gpio_set_input_pullup(self.btn.port_base, self.btn.pin); }
         }
 
@@ -169,7 +164,6 @@ mod board {
             unsafe {
                 match pin {
                     GpioPin::Led1 => gpio_write(self.led1.port_base, self.led1.pin, high),
-                    GpioPin::Led2 => gpio_write(self.led2.port_base, self.led2.pin, high),
                 }
             }
         }
@@ -178,7 +172,6 @@ mod board {
             unsafe {
                 match pin {
                     GpioPin::Led1 => gpio_toggle(self.led1.port_base, self.led1.pin),
-                    GpioPin::Led2 => gpio_toggle(self.led2.port_base, self.led2.pin),
                 }
             }
         }
@@ -237,14 +230,12 @@ mod capsules {
         pub fn write(&self, pin: GpioPin, high: bool) {
             match pin {
                 GpioPin::Led1 => self.led1.write(high),
-                GpioPin::Led2 => self.led2.write(high),
             }
         }
 
         pub fn toggle(&self, pin: GpioPin) {
             match pin {
                 GpioPin::Led1 => self.led1.toggle(),
-                GpioPin::Led2 => self.led2.toggle(),
             }
         }
     }
@@ -255,7 +246,7 @@ mod svc {
     use core::arch::{asm, global_asm};
     use core::sync::atomic::{AtomicU32, Ordering};
 
-    use crate::{GpioPin, Syscalls, gpio_pin_to_idx};
+    use crate::{GpioPin, Syscalls};
 
     pub mod abi {
         pub const NOW_MS: u8 = 1;
@@ -341,13 +332,11 @@ mod svc {
         match call_id {
             abi::NOW_MS => board.now_ms() as u32,
             abi::GPIO_WRITE => {
-                let pin = if a0 == 0 { GpioPin::Led1 } else { GpioPin::Led2 };
-                board.gpio_write(pin, a1 != 0);
+                board.gpio_write(GpioPin::Led1, a1 != 0);
                 0
             }
             abi::GPIO_TOGGLE => {
-                let pin = if a0 == 0 { GpioPin::Led1 } else { GpioPin::Led2 };
-                board.gpio_toggle(pin);
+                board.gpio_toggle(GpioPin::Led1);
                 0
             }
             abi::SLEEP_MS => {
@@ -377,12 +366,12 @@ mod svc {
             let _ = svc_call(abi::SLEEP_MS, ms, 0, 0, 0);
         }
 
-        fn gpio_write(&mut self, pin: GpioPin, high: bool) {
-            let _ = svc_call(abi::GPIO_WRITE, gpio_pin_to_idx(pin), high as u32, 0, 0);
+        fn gpio_write(&mut self, _pin: GpioPin, high: bool) {
+            let _ = svc_call(abi::GPIO_WRITE, 0, high as u32, 0, 0);
         }
 
-        fn gpio_toggle(&mut self, pin: GpioPin) {
-            let _ = svc_call(abi::GPIO_TOGGLE, gpio_pin_to_idx(pin), 0, 0, 0);
+        fn gpio_toggle(&mut self, _pin: GpioPin) {
+            let _ = svc_call(abi::GPIO_TOGGLE, 0, 0, 0, 0);
         }
     }
 }
@@ -549,7 +538,7 @@ pub extern "C" fn task0_entry() -> ! {
 #[unsafe(no_mangle)]
 pub extern "C" fn task1_entry() -> ! {
     loop {
-        syscalls().gpio_toggle(GpioPin::Led2);
+        syscalls().gpio_toggle(GpioPin::Led1);
         for _ in 0..800 {
             cortex_m::asm::nop();
         }
@@ -588,7 +577,6 @@ fn main() -> ! {
 
     let mut board = board::BoardSyscalls::new(
         board::RawPin::new(board::GPIOA, 5),
-        board::RawPin::new(board::GPIOA, 6),
         board::RawPin::new(board::GPIOC, 13),
         CYCLES_PER_MS_ESTIMATE,
     );
@@ -605,3 +593,18 @@ fn main() -> ! {
 
     sched::start();
 }
+
+////////////////////////////////////////////////////////////////////////////////////
+// #![no_std]
+// #![no_main]
+
+// mod os;
+
+// use os::os_main;
+
+// use cortex_m_rt::entry;
+
+// #[entry]
+// fn main() -> ! {
+//     os_main();
+// }
