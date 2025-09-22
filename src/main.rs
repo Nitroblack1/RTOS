@@ -51,6 +51,25 @@ pub const SRAM_START: u32 = 0x2000_0000;
 pub const SRAM_SIZE: u32 = 128 * 1024; // 128KB
 pub const SRAM_END: u32 = SRAM_START + SRAM_SIZE;
 
+/// Dedicated memory regions for MSP/PSP separation
+/// Memory layout: [Kernel Stack (MSP)] [OS Data] [Task1 PSP] [Task2 PSP] [Task3 PSP]
+pub const KERNEL_STACK_SIZE_BYTES: u32 = KERNEL_STACK_SIZE_WORDS as u32 * 4;
+pub const TASK_STACK_SIZE_BYTES: u32 = TASK_STACK_SIZE_WORDS as u32 * 4;
+
+/// Kernel stack region (MSP) - starts at SRAM_START
+pub const KERNEL_STACK_START: u32 = SRAM_START;
+pub const KERNEL_STACK_END: u32 = KERNEL_STACK_START + KERNEL_STACK_SIZE_BYTES;
+
+/// OS data region (ProcessManager, etc.)
+pub const OS_DATA_START: u32 = KERNEL_STACK_END;
+pub const OS_DATA_SIZE: u32 = 2048; // 2KB for OS data structures
+pub const OS_DATA_END: u32 = OS_DATA_START + OS_DATA_SIZE;
+
+/// Application stack region (PSP) - each task gets its own region
+pub const APP_STACK_START: u32 = OS_DATA_END;
+pub const TOTAL_APP_STACK_SIZE: u32 = MAX_TASKS as u32 * TASK_STACK_SIZE_BYTES;
+pub const APP_STACK_END: u32 = APP_STACK_START + TOTAL_APP_STACK_SIZE;
+
 /// Interrupt priorities
 pub const PENDSV_PRIORITY: u8 = 0xFF; // Lowest priority
 pub const SYSTICK_PRIORITY: u8 = 0xFE;
@@ -138,12 +157,98 @@ pub struct ProcessStack([u32; TASK_STACK_SIZE_WORDS]);
 #[derive(Copy, Clone)]
 pub struct KernelStack([u32; KERNEL_STACK_SIZE_WORDS]);
 
-/// Process manager
+/// Comprehensive OS state for pure preemptive multitasking
+#[derive(Copy, Clone)]
+pub struct OSState {
+    /// Currently running task ID
+    pub current_task: usize,
+    /// Task execution time in SysTick cycles (10ms each)
+    pub task_execution_time: [u32; MAX_TASKS],
+    /// Number of times each task has been scheduled
+    pub task_switch_count: [u32; MAX_TASKS],
+    /// Total number of context switches since boot
+    pub total_context_switches: u32,
+    /// System uptime in SysTick cycles (10ms each)
+    pub system_uptime: u32,
+    /// Current time slice remaining for current task (in SysTick cycles)
+    pub time_slice_remaining: u32,
+    /// Task ready queue (bitmask - bit N set = task N is ready)
+    pub ready_tasks: u32,
+    /// Number of active tasks
+    pub active_task_count: usize,
+}
+
+impl OSState {
+    /// Create new OS state
+    pub const fn new() -> Self {
+        Self {
+            current_task: 0,
+            task_execution_time: [0; MAX_TASKS],
+            task_switch_count: [0; MAX_TASKS],
+            total_context_switches: 0,
+            system_uptime: 0,
+            time_slice_remaining: 1, // Start with 1 SysTick cycle (10ms)
+            ready_tasks: 0,
+            active_task_count: 0,
+        }
+    }
+
+    /// Mark task as ready
+    pub fn mark_task_ready(&mut self, task_id: usize) {
+        if task_id < MAX_TASKS {
+            self.ready_tasks |= 1 << task_id;
+        }
+    }
+
+    /// Mark task as not ready
+    pub fn mark_task_not_ready(&mut self, task_id: usize) {
+        if task_id < MAX_TASKS {
+            self.ready_tasks &= !(1 << task_id);
+        }
+    }
+
+    /// Check if task is ready
+    pub fn is_task_ready(&self, task_id: usize) -> bool {
+        if task_id < MAX_TASKS {
+            (self.ready_tasks & (1 << task_id)) != 0
+        } else {
+            false
+        }
+    }
+
+    /// Get next ready task using round-robin
+    pub fn get_next_ready_task(&self) -> Option<usize> {
+        if self.ready_tasks == 0 {
+            return None; // No ready tasks
+        }
+
+        // Start searching from the task after current_task for round-robin
+        let start_task = (self.current_task + 1) % self.active_task_count;
+
+        // Search from start_task to end
+        for i in start_task..self.active_task_count {
+            if self.is_task_ready(i) {
+                return Some(i);
+            }
+        }
+
+        // Search from 0 to start_task (wrap around)
+        for i in 0..start_task {
+            if self.is_task_ready(i) {
+                return Some(i);
+            }
+        }
+
+        None
+    }
+}
+
+/// Process manager with OS state
 pub struct ProcessManager {
     processes: [ProcessControlBlock; MAX_TASKS],
     process_stacks: [ProcessStack; MAX_TASKS],
     kernel_stack: KernelStack,
-    current_process: usize,
+    os_state: OSState,
     next_pid: usize,
 }
 
@@ -160,7 +265,7 @@ impl ProcessManager {
             }; MAX_TASKS],
             process_stacks: [ProcessStack([0; TASK_STACK_SIZE_WORDS]); MAX_TASKS],
             kernel_stack: KernelStack([0; KERNEL_STACK_SIZE_WORDS]),
-            current_process: 0,
+            os_state: OSState::new(),
             next_pid: 0,
         }
     }
@@ -180,7 +285,8 @@ impl ProcessManager {
             ProcessManager::build_initial_stack_static(&mut self.process_stacks[pid].0, entry_point)?
         };
         rprintln!("[PROCESS] Process {} stack initialized with PSP: 0x{:08X}", pid, stack_pointer);
-        rprintln!("[DEBUG] Setting PCB for process {} at index {}", pid, pid);
+
+        rprintln!("[DEBUG] Creating PCB for process {} at index {}", pid, pid);
 
         self.processes[pid] = ProcessControlBlock {
             stack_pointer,
@@ -190,7 +296,12 @@ impl ProcessManager {
             priority: 0,
         };
 
+        // Update OS state for new task
+        self.os_state.mark_task_ready(pid);
+        self.os_state.active_task_count += 1;
+
         rprintln!("[PCB] Process {} control block created", pid);
+        rprintln!("[OS] Task {} marked ready, active tasks: {}", pid, self.os_state.active_task_count);
         rprintln!("[PROCESS] Process {} creation complete", pid);
 
         Ok(pid)
@@ -279,12 +390,17 @@ impl ProcessManager {
         let initial_psp = stack_start_addr + (hw_base as u32 * 4); // Convert word index to byte address
 
         // 5. Comprehensive validation
+        rprintln!("[STACK] Starting PSP validation...");
         unsafe { Self::validate_stack_pointer(initial_psp, "initial stack setup")?; }
+        rprintln!("[STACK] PSP validation passed");
 
         // Ensure the hardware context is 8-byte aligned (ARM requirement)
+        rprintln!("[STACK] Checking 8-byte alignment...");
         if initial_psp & 7 != 0 {
+            rprintln!("[ERROR] PSP 0x{:08X} not 8-byte aligned", initial_psp);
             return Err("Hardware context not 8-byte aligned");
         }
+        rprintln!("[STACK] 8-byte alignment check passed");
 
         rprintln!("[STACK] Stack initialization completed for 0x{:08X}", entry_point);
 
@@ -349,17 +465,6 @@ impl ProcessManager {
         Ok(())
     }
 
-    /// Get current process
-    pub fn current_process(&self) -> usize {
-        self.current_process
-    }
-
-    /// Set current process
-    pub fn set_current_process(&mut self, pid: usize) {
-        if pid < MAX_TASKS {
-            self.current_process = pid;
-        }
-    }
 
     /// Get process by ID
     pub fn get_process(&self, pid: usize) -> Option<&ProcessControlBlock> {
@@ -382,6 +487,71 @@ impl ProcessManager {
     /// Get process count
     pub fn process_count(&self) -> usize {
         self.next_pid
+    }
+
+    /// Get current running task ID
+    pub fn current_task(&self) -> usize {
+        self.os_state.current_task
+    }
+
+    /// Get OS state for debugging
+    pub fn get_os_state(&self) -> &OSState {
+        &self.os_state
+    }
+
+    /// Get mutable OS state
+    pub fn get_os_state_mut(&mut self) -> &mut OSState {
+        &mut self.os_state
+    }
+
+    /// Perform pure preemptive context switch (called by SysTick)
+    pub fn preemptive_schedule(&mut self) -> Option<(u32, u32)> {
+        // Update system uptime
+        self.os_state.system_uptime += 1;
+
+        // Decrement time slice for current task
+        if self.os_state.time_slice_remaining > 0 {
+            self.os_state.time_slice_remaining -= 1;
+        }
+
+        // If time slice expired or no more time, find next task
+        if self.os_state.time_slice_remaining == 0 {
+            if let Some(next_task) = self.os_state.get_next_ready_task() {
+                let current_task = self.os_state.current_task;
+
+                // Only switch if different task
+                if next_task != current_task {
+                    // Update statistics
+                    self.os_state.total_context_switches += 1;
+                    self.os_state.task_switch_count[next_task] += 1;
+
+                    // Update current task
+                    self.os_state.current_task = next_task;
+                    self.os_state.time_slice_remaining = 1; // Reset to 1 tick (10ms)
+
+                    // Update task states
+                    self.processes[current_task].state = ProcessState::Ready;
+                    self.processes[next_task].state = ProcessState::Running;
+
+                    rprintln!("[SCHED] Switch: {} -> {}, switches: {}",
+                             current_task, next_task, self.os_state.total_context_switches);
+
+                    // Return (current_psp, next_psp) for context switch
+                    return Some((
+                        self.processes[current_task].stack_pointer,
+                        self.processes[next_task].stack_pointer
+                    ));
+                }
+            }
+
+            // No task switch needed, reset time slice
+            self.os_state.time_slice_remaining = 1;
+        }
+
+        // Update execution time for current task
+        self.os_state.task_execution_time[self.os_state.current_task] += 1;
+
+        None // No context switch needed
     }
 
     /// Task return handler
@@ -609,6 +779,50 @@ pub fn gpio_toggle() {
 
 // ===== Hardware Abstraction =====
 
+/// Initialize MSP/PSP stack separation
+pub unsafe fn initialize_msp_psp_separation() {
+    unsafe {
+        rprintln!("[MSP/PSP] Initializing stack separation");
+
+        // Read current MSP (set by bootloader - don't change it!)
+        let current_msp: u32;
+        core::arch::asm!(
+            "mrs {}, msp",
+            out(reg) current_msp,
+            options(nomem, nostack)
+        );
+        rprintln!("[MSP/PSP] Current MSP (bootloader set): 0x{:08X}", current_msp);
+
+        // Initialize PSP to 0 (will be set per task when switching)
+        rprintln!("[MSP/PSP] Setting PSP to 0 (will be set per task)...");
+        core::arch::asm!(
+            "msr psp, {}",
+            in(reg) 0u32,
+            options(nomem, nostack)
+        );
+
+        // Verify PSP was set
+        let current_psp: u32;
+        core::arch::asm!(
+            "mrs {}, psp",
+            out(reg) current_psp,
+            options(nomem, nostack)
+        );
+        rprintln!("[MSP/PSP] PSP initialized to: 0x{:08X}", current_psp);
+    }
+
+    // Stay in Handler mode using MSP for kernel operations
+    // Tasks will switch to Thread mode using individual PSPs
+    rprintln!("[MSP/PSP] Stack separation initialized - MSP for kernel, PSP for tasks");
+}
+
+/// Get dedicated stack region for task
+pub fn get_task_stack_region(task_id: usize) -> (u32, u32) {
+    let stack_start = APP_STACK_START + (task_id as u32 * TASK_STACK_SIZE_BYTES);
+    let stack_end = stack_start + TASK_STACK_SIZE_BYTES;
+    (stack_start, stack_end)
+}
+
 /// Initialize SysTick
 unsafe fn initialize_systick() {
     rprintln!("[CORTEX-M] Initializing SysTick");
@@ -659,7 +873,7 @@ pub extern "C" fn pendsv_switch_handler(old_psp: u32) -> u32 {
     rprintln!("[PENDSV-HANDLER] old_psp = 0x{:08X}", old_psp);
 
     let process_mgr = process_manager();
-    let current = process_mgr.current_process();
+    let current = process_mgr.current_task();
 
     rprintln!("[PENDSV-HANDLER] Current process: {}", current);
 
@@ -692,14 +906,14 @@ pub extern "C" fn pendsv_switch_handler(old_psp: u32) -> u32 {
         let next = sched.get_next_process(current);
 
         if next != current {
-            process_mgr.set_current_process(next);
+            process_mgr.get_os_state_mut().current_task = next;
             rprintln!("[SCHEDULER] Context switch: {} -> {}", current, next);
         } else {
             rprintln!("[SCHEDULER] Continuing process {}", current);
         }
 
         // Get next task's saved context
-        let new_process_id = process_mgr.current_process();
+        let new_process_id = process_mgr.current_task();
         let new_process = process_mgr.get_process_mut(new_process_id)
             .unwrap_or_else(|| panic!("Invalid next process ID: {}", new_process_id));
 
@@ -747,212 +961,162 @@ pub extern "C" fn pendsv_switch_handler(old_psp: u32) -> u32 {
 
 global_asm!(
     r#"
-    .global PendSV
-    .type PendSV, %function
-PendSV:
-    @ =========================================================================
-    @ ARM Cortex-M PendSV Handler for Context Switching (FreeRTOS Style)
-    @ =========================================================================
-    @
-    @ Based on ARM Application Note and FreeRTOS xPortPendSVHandler
-    @ Stack Layout: HW Context → Callee-Saved (R4-R11,LR) → FPU Context (S16-S31)
-    @ =========================================================================
+    .global PendSV_Handler
+    .type PendSV_Handler, %function
+PendSV_Handler:
+    /* Cortex-M PendSV Handler (FreeRTOS-style, no FPU) */
 
-    @ Disable interrupts at configurable level (FreeRTOS style)
-    mov     r0, #0xFF               @ BASEPRI mask value
-    msr     basepri, r0             @ Set BASEPRI instead of global disable
-    dsb                             @ Data synchronization barrier
-    isb                             @ Instruction synchronization barrier
-
-    @ Get current Process Stack Pointer
+    /* Save current PSP into r0 */
     mrs     r0, psp
 
-    @ Check if this is the first task switch (PSP == 0)
+    /* Check first switch (PSP == 0) */
     cbz     r0, first_task_switch
 
-    @ -------------------------------------------------------------------------
-    @ NORMAL TASK SWITCH: Save current task, switch to new task
-    @ -------------------------------------------------------------------------
+    /* NORMAL TASK SWITCH */
 normal_task_switch:
+    /* Save callee-saved registers + LR */
+    stmdb   r0!, {{r4-r11, r14}}
 
-    @ Save current task's callee-saved registers (ARM AAPCS standard)
-    @ Stack layout after: ... | HW Context | R4-R11,LR | <- PSP
-    stmdb   r0!, {{r4-r11, r14}}   @ Push R4-R11, LR (9 words = 36 bytes)
+    /* Call Rust handler */
+    bl      {0}
 
-    @ Call Rust scheduler to select next task
-    @ Input:  r0 = current task's PSP (pointing to saved software context)
-    @ Output: r0 = next task's PSP (pointing to software context to restore)
-    bl      {switch_fn}
-
-    @ Restore next task's callee-saved registers
-    @ After this: r0 points to hardware context, LR contains next task's LR
+    /* Restore callee-saved registers + LR */
     ldmia   r0!, {{r4-r11, r14}}
 
-    @ Update PSP to point to hardware context (for CPU auto-restore)
+    /* Update PSP to point to HW context */
     msr     psp, r0
 
-    @ Clear BASEPRI to enable interrupts
-    mov     r0, #0
-    msr     basepri, r0
-    dsb
+    /* Exception return: CPU will restore HW context */
+    bx      lr
+
+    /* FIRST TASK SWITCH */
+first_task_switch:
+    /* Ask Rust handler for first task PSP */
+    bl      {0}
+
+    /* r0 = PSP of first task (points to HW context) */
+    msr     psp, r0
+
+    /* Configure CONTROL: use PSP in Thread mode */
+    mrs     r1, CONTROL
+    orr     r1, r1, #0x02   /* SPSEL: use PSP */
+    msr     CONTROL, r1
     isb
 
-    @ Standard exception return - CPU will restore HW context automatically
-    @ EXC_RETURN in LR determines return mode (Thread mode, PSP, FPU context)
-    bx      lr
-
-    @ -------------------------------------------------------------------------
-    @ FIRST TASK SWITCH: Initialize first task from kernel mode
-    @ -------------------------------------------------------------------------
-first_task_switch:
-    @ Call Rust scheduler to get first task's initial PSP
-    @ Input:  r0 = 0 (no current task to save)
-    @ Output: r0 = first task's initial PSP (pointing to hardware context)
-    bl      {switch_fn}
-
-    @ r0 now contains initial PSP pointing to hardware context
-    @ No software context to restore for first task - it's pristine
-
-    @ Set PSP for first task - points to pre-initialized hardware context
-    msr     psp, r0
-
-    @ Configure CONTROL register: use PSP in Thread mode, enable FPU
-    mrs     r1, CONTROL
-    orr     r1, r1, #0x02          @ SPSEL: Use PSP for Thread mode
-    orr     r1, r1, #0x04          @ FPCA: FPU context active
-    msr     CONTROL, r1
-    isb                            @ Instruction Synchronization Barrier
-
-    @ Clear BASEPRI to enable interrupts
-    mov     r1, #0
-    msr     basepri, r1
-
-    @ Return to first task in Thread mode using PSP
-    @ EXC_RETURN = 0xFFFFFFED: Thread mode, PSP, FPU context present
-    ldr     lr, =0xFFFFFFED
+    /* Return with EXC_RETURN for Thread+PSP (no FPU) */
+    ldr     lr, =0xFFFFFFFD
     bx      lr
 "#,
-    switch_fn = sym pendsv_switch_handler
+    sym pendsv_switch_handler
 );
 
-/// SysTick interrupt handler
-#[cortex_m_rt::exception]
-fn SysTick() {
-    trigger_pendsv();
-}
+
 
 // ===== Tasks =====
 
-/// Task 0: LED control task
+/// Task 0: LED control task (Pure Preemptive)
 #[unsafe(no_mangle)]
 pub extern "C" fn task0_entry() -> ! {
-    rprintln!("[TASK0] Starting LED control task");
+    rprintln!("[TASK0] Starting pure preemptive LED control task");
 
-    // Turn on LED immediately
-    gpio_write(true);
-    rprintln!("[TASK0] LED should be ON");
+    let mut counter = 0u32;
 
-    // Cooperative multitasking - work in rounds
-    for round in 0..10 {
-        rprintln!("[TASK0] LED task round {}", round);
+    // Pure preemptive task - runs continuously until preempted by SysTick
+    loop {
+        // Turn LED on
+        gpio_write(true);
 
-        // Do work for about 1 second
-        for _ in 0..CYCLES_PER_MS * 1000 {
-            cortex_m::asm::nop();
-        }
+        // Do some work - will be preempted by SysTick every 10ms
+        counter = counter.wrapping_add(1);
 
-        // Yield to next task
-        rprintln!("[TASK0] Yielding to next task");
-        trigger_pendsv();
-
-        // Small delay for context switch
+        // Minimal work to show task is running
         for _ in 0..1000 {
             cortex_m::asm::nop();
         }
-    }
 
-    rprintln!("[TASK0] Completed work, idling");
-    loop {
-        cortex_m::asm::wfi();
+        // Every 100000 iterations, print status
+        if counter % 100000 == 0 {
+            rprintln!("[TASK0] LED task running, counter: {}", counter);
+        }
     }
 }
 
-/// Task 1: General purpose task
+/// Task 1: General purpose task (Pure Preemptive)
 #[unsafe(no_mangle)]
 pub extern "C" fn task1_entry() -> ! {
-    rprintln!("[TASK1] Starting general purpose task");
+    rprintln!("[TASK1] Starting pure preemptive general task");
 
-    // Cooperative multitasking - work in rounds
-    for round in 0..8 {
-        rprintln!("[TASK1] General task round {}", round);
+    let mut counter = 0u32;
 
+    // Pure preemptive task - runs continuously until preempted by SysTick
+    loop {
         // Toggle LED to show activity
         gpio_toggle();
-        rprintln!("[TASK1] LED toggled");
 
-        // Do work for about 1 second
-        for _ in 0..CYCLES_PER_MS * 1000 {
+        // Do some work - will be preempted by SysTick every 10ms
+        counter = counter.wrapping_add(1);
+
+        // Minimal work to show task is running
+        for _ in 0..2000 {
             cortex_m::asm::nop();
         }
 
-        // Yield to next task
-        rprintln!("[TASK1] Yielding to next task");
-        trigger_pendsv();
-
-        // Small delay for context switch
-        for _ in 0..1000 {
-            cortex_m::asm::nop();
+        // Every 50000 iterations, print status
+        if counter % 50000 == 0 {
+            rprintln!("[TASK1] General task running, counter: {}", counter);
         }
-    }
-
-    rprintln!("[TASK1] Completed work, idling");
-    loop {
-        cortex_m::asm::wfi();
     }
 }
 
-/// Task 2: Background task
+/// Task 2: Background task (Pure Preemptive)
 #[unsafe(no_mangle)]
 pub extern "C" fn task2_entry() -> ! {
-    rprintln!("[TASK2] Starting background task");
+    rprintln!("[TASK2] Starting pure preemptive background task");
 
-    // Cooperative multitasking - work in rounds
-    for round in 0..6 {
-        rprintln!("[TASK2] Background task round {}", round);
+    let mut counter = 0u32;
+    let mut led_state = false;
 
-        // Turn LED off to show different behavior
-        gpio_write(false);
-        rprintln!("[TASK2] LED turned OFF");
-
-        // Do work for about 0.5 second
-        for _ in 0..CYCLES_PER_MS * 500 {
-            cortex_m::asm::nop();
-        }
-
-        // Turn LED back on
-        gpio_write(true);
-        rprintln!("[TASK2] LED turned ON");
-
-        // Do work for another 0.5 second
-        for _ in 0..CYCLES_PER_MS * 500 {
-            cortex_m::asm::nop();
-        }
-
-        // Yield to next task
-        rprintln!("[TASK2] Yielding to next task");
-        trigger_pendsv();
-
-        // Small delay for context switch
-        for _ in 0..1000 {
-            cortex_m::asm::nop();
-        }
-    }
-
-    rprintln!("[TASK2] Completed work, idling");
+    // Pure preemptive task - runs continuously until preempted by SysTick
     loop {
-        cortex_m::asm::wfi();
+        // Alternate LED state every few iterations
+        counter = counter.wrapping_add(1);
+
+        if counter % 3000 == 0 {
+            led_state = !led_state;
+            gpio_write(led_state);
+        }
+
+        // Minimal work to show task is running
+        for _ in 0..500 {
+            cortex_m::asm::nop();
+        }
+
+        // Every 25000 iterations, print status
+        if counter % 25000 == 0 {
+            rprintln!("[TASK2] Background task running, counter: {}, LED: {}",
+                     counter, if led_state { "ON" } else { "OFF" });
+        }
     }
 }
+
+// ===== Exception Handlers =====
+
+/// SysTick handler - performs pure preemptive scheduling every 10ms
+#[unsafe(no_mangle)]
+pub extern "C" fn SysTick() {
+    // Get process manager and perform preemptive scheduling
+    let process_mgr = process_manager();
+
+    if let Some((current_psp, _next_psp)) = process_mgr.preemptive_schedule() {
+        // A context switch is needed - update current task's PSP first
+        process_mgr.processes[process_mgr.os_state.current_task].stack_pointer = current_psp;
+
+        // Trigger PendSV for actual context switching
+        trigger_pendsv();
+    }
+    // If no context switch needed, just continue with current task
+}
+
 
 /// Main entry point
 #[entry]
@@ -967,24 +1131,38 @@ fn main() -> ! {
 
     rprintln!("[MINI-OS] Booting...");
 
+    // Initialize MSP/PSP stack separation
+    unsafe {
+        initialize_msp_psp_separation();
+    }
+    rprintln!("[MAIN] MSP/PSP initialization completed");
+
     // Initialize GPIO system
+    rprintln!("[MAIN] Starting GPIO initialization...");
     unsafe {
         init_gpio();
-        // LED ON = GPIO initialized
-        gpio_write(true);
-        for _ in 0..1000000 { cortex_m::asm::nop(); }
+        rprintln!("[MAIN] GPIO initialization completed");
 
-        // LED OFF = Starting process manager
+        // LED ON = GPIO initialized (Step 1)
+        gpio_write(true);
+        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        rprintln!("[MAIN] LED ON - GPIO ready");
+
+        // LED OFF = Starting process manager (Step 2)
         gpio_write(false);
-        for _ in 0..1000000 { cortex_m::asm::nop(); }
+        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        rprintln!("[MAIN] LED OFF - Starting ProcessManager");
     }
 
     // Initialize process manager and create processes
+    rprintln!("[MAIN] Creating ProcessManager...");
     let process_mgr = process_manager();
+    rprintln!("[MAIN] ProcessManager created successfully");
 
-    // LED ON = Process manager ready
+    // LED ON = Process manager ready (Step 3)
     gpio_write(true);
-    for _ in 0..1000000 { cortex_m::asm::nop(); }
+    for _ in 0..2000000 { cortex_m::asm::nop(); }
+    rprintln!("[MAIN] LED ON - ProcessManager ready");
 
     // Memory usage analysis
     let mgr_addr = process_mgr as *const _ as u32;
@@ -993,62 +1171,224 @@ fn main() -> ! {
     rprintln!("[MEM] Total task stack memory: {} bytes", MAX_TASKS * TASK_STACK_SIZE_WORDS * 4);
     rprintln!("[MEM] SRAM usage: {}/{} bytes", mgr_addr - SRAM_START + mgr_size as u32, SRAM_SIZE);
 
+    rprintln!("[MAIN] Starting process creation...");
     unsafe {
         // Create processes with LED indicators
 
-        // LED OFF = Starting process 0
+        // LED OFF = Starting process 0 creation (Step 4)
         gpio_write(false);
-        for _ in 0..1000 { cortex_m::asm::nop(); }
+        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        rprintln!("[MAIN] LED OFF - Creating Process 0");
 
         let _pid0 = process_mgr.create_process(task0_entry as usize)
             .expect("Failed to create task 0");
+        rprintln!("[MAIN] Process 0 created successfully");
 
-        // LED ON = Process 0 created
+        // LED ON = Process 0 created (Step 5)
         gpio_write(true);
-        for _ in 0..1000 { cortex_m::asm::nop(); }
+        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        rprintln!("[MAIN] LED ON - Process 0 ready");
 
-        // LED OFF = Starting process 1
+        // LED OFF = Starting process 1 creation (Step 6)
         gpio_write(false);
-        for _ in 0..1000 { cortex_m::asm::nop(); }
+        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        rprintln!("[MAIN] LED OFF - Creating Process 1");
 
         process_mgr.create_process(task1_entry as usize)
             .expect("Failed to create task 1");
+        rprintln!("[MAIN] Process 1 created successfully");
 
-        // LED ON = Process 1 created
+        // LED ON = Process 1 created (Step 7)
         gpio_write(true);
-        for _ in 0..1000 { cortex_m::asm::nop(); }
+        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        rprintln!("[MAIN] LED ON - Process 1 ready");
 
-        // LED OFF = Starting process 2
+        // LED OFF = Starting process 2 creation (Step 8)
         gpio_write(false);
-        for _ in 0..1000 { cortex_m::asm::nop(); }
+        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        rprintln!("[MAIN] LED OFF - Creating Process 2");
 
         process_mgr.create_process(task2_entry as usize)
             .expect("Failed to create task 2");
+        rprintln!("[MAIN] Process 2 created successfully");
 
-        // LED ON = All processes created
+        // LED ON = All processes created (Step 9)
         gpio_write(true);
-        for _ in 0..1000 { cortex_m::asm::nop(); }
+        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        rprintln!("[MAIN] LED ON - All processes created");
     }
 
-    // Initialize and start scheduler
-    // LED OFF = Starting scheduler initialization
-    gpio_write(false);
-    for _ in 0..1000 { cortex_m::asm::nop(); }
-    
+    rprintln!("[MAIN] All {} processes created successfully!", MAX_TASKS);
 
-    let scheduler = scheduler();
-    scheduler.initialize();
+    // Initialize pure preemptive scheduler
+    rprintln!("[MAIN] Starting preemptive scheduler initialization...");
+    unsafe {
+        // LED OFF = Starting scheduler initialization (Step 10)
+        gpio_write(false);
+        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        rprintln!("[MAIN] LED OFF - Starting scheduler");
 
-    // LED ON = Scheduler initialized, ready to start
-    gpio_write(true);
-    for _ in 0..1000 { cortex_m::asm::nop(); }
-    
-    // LED OFF = Starting scheduler
-    gpio_write(false);
-    for _ in 0..1000 { cortex_m::asm::nop(); }
-    
+        rprintln!("[PREEMPTIVE] Starting pure preemptive multitasking");
 
-    scheduler.start();
+        // Initialize SysTick for preemptive scheduling
+        initialize_systick();
+        rprintln!("[PREEMPTIVE] SysTick initialized for 10ms time slices");
+
+        // LED ON = SysTick initialized (Step 11)
+        gpio_write(true);
+        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        rprintln!("[MAIN] LED ON - SysTick ready");
+
+        // Set first task as current and running
+        rprintln!("[PREEMPTIVE] Setting up first task state...");
+        process_mgr.os_state.current_task = 0;
+        process_mgr.processes[0].state = ProcessState::Running;
+        rprintln!("[PREEMPTIVE] Task 0 set as initial running task");
+
+        // LED OFF = Preparing PSP (Step 12)
+        gpio_write(false);
+        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        rprintln!("[MAIN] LED OFF - Setting PSP");
+
+        // Set PSP to first task's stack pointer for direct jump
+        let initial_psp = process_mgr.processes[0].stack_pointer;
+        rprintln!("[PREEMPTIVE] First task PSP (hardware context): 0x{:08X}", initial_psp);
+
+        // Validate PSP range
+        if initial_psp < SRAM_START || initial_psp >= SRAM_END {
+            rprintln!("[ERROR] PSP 0x{:08X} out of SRAM bounds!", initial_psp);
+        } else {
+            rprintln!("[PREEMPTIVE] PSP validation: OK");
+        }
+
+        // Detailed stack frame verification
+        rprintln!("[STACK_VERIFY] Analyzing task 0 stack frame...");
+        let stack_base_ptr = initial_psp as *const u32;
+        let r0 = core::ptr::read_volatile(stack_base_ptr.offset(0));
+        let r1 = core::ptr::read_volatile(stack_base_ptr.offset(1));
+        let r2 = core::ptr::read_volatile(stack_base_ptr.offset(2));
+        let r3 = core::ptr::read_volatile(stack_base_ptr.offset(3));
+        let r12 = core::ptr::read_volatile(stack_base_ptr.offset(4));
+        let lr = core::ptr::read_volatile(stack_base_ptr.offset(5));
+        let pc = core::ptr::read_volatile(stack_base_ptr.offset(6));
+        let xpsr = core::ptr::read_volatile(stack_base_ptr.offset(7));
+
+        rprintln!("[HW_CONTEXT] R0=0x{:08X}, R1=0x{:08X}, R2=0x{:08X}, R3=0x{:08X}", r0, r1, r2, r3);
+        rprintln!("[HW_CONTEXT] R12=0x{:08X}, LR=0x{:08X}", r12, lr);
+        rprintln!("[HW_CONTEXT] PC=0x{:08X}, xPSR=0x{:08X}", pc, xpsr);
+
+        // Verify PC has Thumb bit set and points to valid task
+        if (pc & 1) == 0 {
+            rprintln!("[ERROR] PC 0x{:08X} missing Thumb bit!", pc);
+        } else {
+            rprintln!("[VERIFY] PC Thumb bit check: OK");
+        }
+
+        // Verify xPSR has Thumb state bit
+        if (xpsr & 0x01000000) == 0 {
+            rprintln!("[ERROR] xPSR 0x{:08X} missing Thumb state!", xpsr);
+        } else {
+            rprintln!("[VERIFY] xPSR Thumb state check: OK");
+        }
+
+        // Set PSP register
+        rprintln!("[PREEMPTIVE] Setting PSP register...");
+        core::arch::asm!(
+            "msr psp, {}",
+            in(reg) initial_psp
+        );
+
+        // Verify PSP was set correctly
+        let current_psp: u32;
+        core::arch::asm!(
+            "mrs {}, psp",
+            out(reg) current_psp
+        );
+        rprintln!("[PREEMPTIVE] PSP set and verified: 0x{:08X}", current_psp);
+
+        // Verify PSP matches what we set
+        if current_psp != initial_psp {
+            rprintln!("[ERROR] PSP mismatch! Set: 0x{:08X}, Read: 0x{:08X}", initial_psp, current_psp);
+        } else {
+            rprintln!("[VERIFY] PSP register check: OK");
+        }
+
+        // Read and log current CPU state before Thread mode switch
+        let current_msp: u32;
+        let current_control: u32;
+        let current_primask: u32;
+        core::arch::asm!(
+            "mrs {}, msp",
+            out(reg) current_msp
+        );
+        core::arch::asm!(
+            "mrs {}, control",
+            out(reg) current_control
+        );
+        core::arch::asm!(
+            "mrs {}, primask",
+            out(reg) current_primask
+        );
+
+        rprintln!("[CPU_STATE] Before Thread switch:");
+        rprintln!("[CPU_STATE] MSP=0x{:08X}, PSP=0x{:08X}", current_msp, current_psp);
+        rprintln!("[CPU_STATE] CONTROL=0x{:08X} (SPSEL={}, nPRIV={})",
+                 current_control, (current_control >> 1) & 1, current_control & 1);
+        rprintln!("[CPU_STATE] PRIMASK=0x{:08X} (interrupts {})",
+                 current_primask, if current_primask & 1 != 0 { "disabled" } else { "enabled" });
+
+        // LED ON = PSP ready (Step 13)
+        gpio_write(true);
+        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        rprintln!("[MAIN] LED ON - PSP configured");
+
+        // Final preparation before Thread mode switch
+        rprintln!("[PREEMPTIVE] About to switch to Thread mode...");
+        rprintln!("[PREEMPTIVE] EXC_RETURN will be: 0xFFFFFFFD (Thread+PSP)");
+
+        // LED OFF = About to switch to Thread mode (Step 14)
+        gpio_write(false);
+        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        rprintln!("[MAIN] LED OFF - Switching to Thread mode NOW!");
+
+        // This is the critical moment - switch to Thread mode
+        // For first task startup, we need to:
+        // 1. Set PSP to top of stack (above hardware context)
+        // 2. Switch to Thread mode with PSP using CONTROL register
+        // 3. Jump directly to task entry point
+
+        rprintln!("[PREEMPTIVE] Starting first task with direct Thread mode switch");
+
+        // Get stack top (above the pre-built context) for first task
+        // The initial_psp points to hardware context, but for startup we need stack top
+        let stack_top = process_mgr.processes[0].stack_pointer + (HW_CONTEXT_SIZE as u32 * 4);
+        rprintln!("[PREEMPTIVE] Setting PSP to stack top: 0x{:08X}", stack_top);
+
+        // Set PSP register to stack top
+        core::arch::asm!(
+            "msr psp, {}",
+            in(reg) stack_top
+        );
+
+        // Switch to Thread mode using PSP via CONTROL register
+        core::arch::asm!(
+            "mrs r0, control",      // Read current CONTROL register
+            "orr r0, r0, #0x02",    // Set SPSEL bit (use PSP instead of MSP)
+            "msr control, r0",      // Update CONTROL register
+            "isb",                  // Instruction Synchronization Barrier
+            out("r0") _,
+        );
+
+        // Jump directly to first task entry point in Thread mode
+        let task_entry = task0_entry as u32;
+        rprintln!("[PREEMPTIVE] Jumping to task0_entry: 0x{:08X}", task_entry);
+
+        core::arch::asm!(
+            "bx {}",
+            in(reg) task_entry,
+            options(noreturn)
+        );
+    }
 }
 
 /// Hard Fault Handler for debugging
