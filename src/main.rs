@@ -34,11 +34,8 @@ pub const SW_CONTEXT_SIZE: usize = 9;
 /// Hardware context size (r0-r3, r12, lr, pc, xpsr)
 pub const HW_CONTEXT_SIZE: usize = 8;
 
-/// FPU extended context size (s16-s31 only, FPSCR handled by hardware)
-pub const FPU_CONTEXT_SIZE: usize = 16;
-
-/// Total context size with FPU support
-pub const TOTAL_CONTEXT_SIZE: usize = SW_CONTEXT_SIZE + HW_CONTEXT_SIZE + FPU_CONTEXT_SIZE;
+/// Total context size without FPU
+pub const TOTAL_CONTEXT_SIZE: usize = SW_CONTEXT_SIZE + HW_CONTEXT_SIZE;
 
 /// Stack guard size (in words)
 pub const STACK_GUARD_SIZE: usize = 4;
@@ -69,8 +66,8 @@ pub const TIME_SLICE_MS: u32 = 10;
 /// EXC_RETURN for Thread mode, PSP, no FPU context
 pub const EXC_RETURN_THREAD_PSP: u32 = 0xFFFFFFFD;
 
-/// EXC_RETURN for Thread mode, PSP, with FPU context
-pub const EXC_RETURN_THREAD_PSP_FPU: u32 = 0xFFFFFFED;
+/// EXC_RETURN for Thread mode, MSP
+pub const EXC_RETURN_THREAD_MSP: u32 = 0xFFFFFFF9;
 
 // ===== Register Addresses =====
 
@@ -79,12 +76,6 @@ pub const NVIC_ICSR: u32 = 0xE000_ED04;
 
 /// SCB SHPR3 register
 pub const SCB_SHPR3: u32 = 0xE000_ED20;
-
-/// FPU registers
-pub const FPU_CPACR: u32 = 0xE000_ED88; // Coprocessor Access Control Register
-pub const FPU_FPCCR: u32 = 0xE000_EF34; // FP Context Control Register
-pub const FPU_FPCAR: u32 = 0xE000_EF38; // FP Context Address Register
-pub const FPU_FPDSCR: u32 = 0xE000_EF3C; // FP Default Status Control Register
 
 /// SysTick registers
 pub const SYSTICK_CSR: u32 = 0xE000_E010;
@@ -126,8 +117,6 @@ pub struct ProcessControlBlock {
     pub exc_return: u32,
     /// Task priority (for future scheduling enhancement)
     pub priority: u8,
-    /// FPU context enabled for this task
-    pub fpu_enabled: bool,
 }
 
 /// Process states
@@ -166,9 +155,8 @@ impl ProcessManager {
                 stack_pointer: 0,
                 process_id: 0,
                 state: ProcessState::Ready,
-                exc_return: EXC_RETURN_THREAD_PSP_FPU, // Thread mode, PSP, with FPU
+                exc_return: EXC_RETURN_THREAD_PSP, // Thread mode, PSP, no FPU
                 priority: 0,
-                fpu_enabled: true,
             }; MAX_TASKS],
             process_stacks: [ProcessStack([0; TASK_STACK_SIZE_WORDS]); MAX_TASKS],
             kernel_stack: KernelStack([0; KERNEL_STACK_SIZE_WORDS]),
@@ -198,9 +186,8 @@ impl ProcessManager {
             stack_pointer,
             process_id: pid,
             state: ProcessState::Ready,
-            exc_return: EXC_RETURN_THREAD_PSP_FPU, // Thread mode, PSP, with FPU
+            exc_return: EXC_RETURN_THREAD_PSP, // Thread mode, PSP, no FPU
             priority: 0,
-            fpu_enabled: true,
         };
 
         rprintln!("[PCB] Process {} control block created", pid);
@@ -233,8 +220,8 @@ impl ProcessManager {
 
         rprintln!("[STACK] Building stack for entry 0x{:08X}", entry_point);
 
-        // Calculate stack layout with proper 8-byte alignment including FPU context
-        let total_context = SW_CONTEXT_SIZE + HW_CONTEXT_SIZE + FPU_CONTEXT_SIZE + STACK_GUARD_SIZE;
+        // Calculate stack layout with proper 8-byte alignment
+        let total_context = SW_CONTEXT_SIZE + HW_CONTEXT_SIZE + STACK_GUARD_SIZE;
 
         // Ensure 8-byte alignment - ARM Cortex-M requirement
         // Since each word is 4 bytes, we need even number of words for 8-byte alignment
@@ -242,8 +229,8 @@ impl ProcessManager {
         let stack_base = len - aligned_context;
 
         // Additional check: ensure the hardware context starts at 8-byte boundary
-        // Stack layout (from high to low): Guard | Hardware | Software | FPU
-        let hw_base_tentative = stack_base + SW_CONTEXT_SIZE + FPU_CONTEXT_SIZE;
+        // Stack layout (from high to low): Guard | Hardware | Software
+        let hw_base_tentative = stack_base + SW_CONTEXT_SIZE;
         let stack_start_addr = stack.as_ptr() as u32;
         let hw_psp_tentative = stack_start_addr + (hw_base_tentative as u32 * 4);
 
@@ -259,7 +246,7 @@ impl ProcessManager {
             stack[guard_base + i] = STACK_GUARD_PATTERN;
         }
         // 2. Initialize Hardware Context (CPU automatically saves these)
-        let hw_base = stack_base + SW_CONTEXT_SIZE + FPU_CONTEXT_SIZE;
+        let hw_base = stack_base + SW_CONTEXT_SIZE;
         stack[hw_base + 0] = 0x00000000; // R0 - first argument
         stack[hw_base + 1] = 0x01010101; // R1 - second argument
         stack[hw_base + 2] = 0x02020202; // R2 - third argument
@@ -286,35 +273,8 @@ impl ProcessManager {
 
         rprintln!("[STACK] Software context initialized");
 
-        // 4. Initialize FPU Extended Context (s16-s31, FPSCR)
-        // FPU context goes below Software Context (lowest addresses)
-
-        // Check for underflow before subtracting
-        if stack_base < FPU_CONTEXT_SIZE {
-            rprintln!("[ERROR] Stack base {} too small for FPU context size {}",
-                      stack_base, FPU_CONTEXT_SIZE);
-            return Err("Stack too small for FPU context");
-        }
-
-        let fpu_base = stack_base - FPU_CONTEXT_SIZE;
-
-        // Validate FPU context indices
-        if fpu_base >= len || (fpu_base + FPU_CONTEXT_SIZE) > len {
-            rprintln!("[ERROR] FPU context indices out of bounds: fpu_base={}, len={}, FPU_SIZE={}",
-                      fpu_base, len, FPU_CONTEXT_SIZE);
-            return Err("FPU context out of bounds");
-        }
-
-        // Initialize S16-S31 registers (FPSCR handled by hardware)
-        for i in 0..16 {
-            stack[fpu_base + i] = 0x16160000 + i as u32; // S16-S31 registers
-        }
-
-        rprintln!("[STACK] FPU context initialized");
-
-        // 5. Calculate initial PSP for first task start
+        // 4. Calculate initial PSP for first task start
         // For first task: PSP should point to Hardware Context (CPU will pop this)
-        // Note: FPU context is below software context and will be skipped for first task
         let stack_start_addr = stack.as_ptr() as u32;
         let initial_psp = stack_start_addr + (hw_base as u32 * 4); // Convert word index to byte address
 
@@ -366,7 +326,7 @@ impl ProcessManager {
             let len = stack.len();
 
             // Calculate guard position using same logic as stack initialization
-            let total_context = SW_CONTEXT_SIZE + HW_CONTEXT_SIZE + FPU_CONTEXT_SIZE + STACK_GUARD_SIZE;
+            let total_context = SW_CONTEXT_SIZE + HW_CONTEXT_SIZE + STACK_GUARD_SIZE;
             let aligned_context = (total_context + 1) & !1;
             let stack_base = len - aligned_context;
             let guard_start = stack_base + SW_CONTEXT_SIZE + HW_CONTEXT_SIZE;
@@ -541,44 +501,8 @@ pub fn scheduler() -> &'static mut Scheduler {
     unsafe { &mut *core::ptr::addr_of_mut!(SCHEDULER) }
 }
 
-// ===== FPU Functions =====
 
-static mut FPU_INITIALIZED: bool = false;
 
-/// Initialize FPU for STM32F446 (Cortex-M4F)
-pub unsafe fn init_fpu() {
-    unsafe {
-        if FPU_INITIALIZED {
-            return;
-        }
-
-        rprintln!("[FPU] Initializing FPU...");
-
-        // 1. Enable CP10 and CP11 coprocessors (FPU access)
-        let mut cpacr = read_volatile(FPU_CPACR as *const u32);
-        cpacr |= 0xF << 20; // Full access for CP10 and CP11
-        write_volatile(FPU_CPACR as *mut u32, cpacr);
-
-        // 2. Configure FP Context Control Register (FPCCR) - Disable ALL lazy stacking
-        let mut fpccr = read_volatile(FPU_FPCCR as *const u32);
-        fpccr &= !(1 << 31); // Disable ASPEN (automatic lazy context save)
-        fpccr &= !(1 << 30); // Disable LSPEN (lazy state preservation) for deterministic behavior
-        write_volatile(FPU_FPCCR as *mut u32, fpccr);
-
-        // 3. Initialize FP Default Status Control Register
-        write_volatile(FPU_FPDSCR as *mut u32, 0);
-
-        // 4. Memory barrier to ensure FPU configuration is complete
-        cortex_m::asm::dsb();
-        cortex_m::asm::isb();
-
-        FPU_INITIALIZED = true;
-        rprintln!("[FPU] FPU initialized successfully");
-        rprintln!("[FPU] CPACR=0x{:08X}, FPCCR=0x{:08X}",
-                  read_volatile(FPU_CPACR as *const u32),
-                  read_volatile(FPU_FPCCR as *const u32));
-    }
-}
 
 // ===== GPIO Functions =====
 
@@ -850,12 +774,9 @@ PendSV:
     @ NORMAL TASK SWITCH: Save current task, switch to new task
     @ -------------------------------------------------------------------------
 normal_task_switch:
-    @ Save FPU extended context first (S16-S31) - Always save for deterministic behavior
-    @ FPU lazy stacking is disabled, so we manually save/restore
-    vstmdb  r0!, {{s16-s31}}        @ Push S16-S31 to stack (16 regs × 4 bytes = 64 bytes)
 
     @ Save current task's callee-saved registers (ARM AAPCS standard)
-    @ Stack layout after: ... | HW Context | R4-R11,LR | S16-S31 | <- PSP
+    @ Stack layout after: ... | HW Context | R4-R11,LR | <- PSP
     stmdb   r0!, {{r4-r11, r14}}   @ Push R4-R11, LR (9 words = 36 bytes)
 
     @ Call Rust scheduler to select next task
@@ -864,11 +785,8 @@ normal_task_switch:
     bl      {switch_fn}
 
     @ Restore next task's callee-saved registers
-    @ After this: r0 points to FPU context, LR contains next task's LR
+    @ After this: r0 points to hardware context, LR contains next task's LR
     ldmia   r0!, {{r4-r11, r14}}
-
-    @ Restore FPU extended context (S16-S31)
-    vldmia  r0!, {{s16-s31}}
 
     @ Update PSP to point to hardware context (for CPU auto-restore)
     msr     psp, r0
@@ -1049,11 +967,6 @@ fn main() -> ! {
 
     rprintln!("[MINI-OS] Booting...");
 
-    // Initialize FPU for Cortex-M4F
-    unsafe {
-        init_fpu();
-    }
-
     // Initialize GPIO system
     unsafe {
         init_gpio();
@@ -1085,42 +998,42 @@ fn main() -> ! {
 
         // LED OFF = Starting process 0
         gpio_write(false);
-        for _ in 0..500000 { cortex_m::asm::nop(); }
+        for _ in 0..1000 { cortex_m::asm::nop(); }
 
         let _pid0 = process_mgr.create_process(task0_entry as usize)
             .expect("Failed to create task 0");
 
         // LED ON = Process 0 created
         gpio_write(true);
-        for _ in 0..500000 { cortex_m::asm::nop(); }
+        for _ in 0..1000 { cortex_m::asm::nop(); }
 
         // LED OFF = Starting process 1
         gpio_write(false);
-        for _ in 0..500000 { cortex_m::asm::nop(); }
+        for _ in 0..1000 { cortex_m::asm::nop(); }
 
         process_mgr.create_process(task1_entry as usize)
             .expect("Failed to create task 1");
 
         // LED ON = Process 1 created
         gpio_write(true);
-        for _ in 0..500000 { cortex_m::asm::nop(); }
+        for _ in 0..1000 { cortex_m::asm::nop(); }
 
         // LED OFF = Starting process 2
         gpio_write(false);
-        for _ in 0..500000 { cortex_m::asm::nop(); }
+        for _ in 0..1000 { cortex_m::asm::nop(); }
 
         process_mgr.create_process(task2_entry as usize)
             .expect("Failed to create task 2");
 
         // LED ON = All processes created
         gpio_write(true);
-        for _ in 0..500000 { cortex_m::asm::nop(); }
+        for _ in 0..1000 { cortex_m::asm::nop(); }
     }
 
     // Initialize and start scheduler
     // LED OFF = Starting scheduler initialization
     gpio_write(false);
-    for _ in 0..500000 { cortex_m::asm::nop(); }
+    for _ in 0..1000 { cortex_m::asm::nop(); }
     
 
     let scheduler = scheduler();
@@ -1128,11 +1041,11 @@ fn main() -> ! {
 
     // LED ON = Scheduler initialized, ready to start
     gpio_write(true);
-    for _ in 0..500000 { cortex_m::asm::nop(); }
+    for _ in 0..1000 { cortex_m::asm::nop(); }
     
     // LED OFF = Starting scheduler
     gpio_write(false);
-    for _ in 0..500000 { cortex_m::asm::nop(); }
+    for _ in 0..1000 { cortex_m::asm::nop(); }
     
 
     scheduler.start();
