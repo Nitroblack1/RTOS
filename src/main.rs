@@ -1,11 +1,13 @@
-//! STM32F446 Mini-OS - Monolithic Implementation
+//! STM32F446 FreeRTOS-Style Mini-OS
 //!
-//! A complete mini operating system implementation in a single file
-//! with multitasking, context switching, and hardware abstraction.
+//! A FreeRTOS-style RTOS implementation following FreeRTOS-Kernel patterns
+//! with proper context switching, task management, and hardware abstraction.
 
 #![no_std]
 #![no_main]
 #![allow(dead_code)]
+#![allow(non_camel_case_types)]
+#![allow(non_upper_case_globals)]
 
 use cortex_m_rt::entry;
 use panic_halt as _;
@@ -13,72 +15,437 @@ use rtt_target::{rprintln, rtt_init_print};
 use core::arch::global_asm;
 use core::ptr::{read_volatile, write_volatile};
 use cortex_m_rt::exception;
+use core::ffi::c_void;
 
-// ===== Configuration =====
+// ===== FreeRTOS-Style Configuration =====
 
 /// System clock frequency (16 MHz HSI)
 pub const SYSTEM_CLOCK_HZ: u32 = 16_000_000;
 
-/// Maximum number of tasks
+// FreeRTOS Configuration Constants
+pub const configUSE_PREEMPTION: u32 = 1;
+pub const configUSE_TASK_NOTIFICATIONS: u32 = 1;
+pub const configUSE_16_BIT_TICKS: u32 = 0;
+pub const configMAX_PRIORITIES: usize = 5;
+pub const configMINIMAL_STACK_SIZE: usize = 64; // Stack size in words
+pub const configMAX_TASK_NAME_LEN: usize = 16;
+pub const configUSE_TRACE_FACILITY: u32 = 1;
+pub const configCHECK_FOR_STACK_OVERFLOW: u32 = 2;
+
+/// Maximum number of tasks (application specific)
 pub const MAX_TASKS: usize = 3;
 
-/// Task stack size in words (256 bytes per task)
-pub const TASK_STACK_SIZE_WORDS: usize = 64;
+/// Interrupt priorities (following ARM Cortex-M4 conventions)
+pub const configKERNEL_INTERRUPT_PRIORITY: u8 = 255;        // Lowest priority
+pub const configMAX_SYSCALL_INTERRUPT_PRIORITY: u8 = 191;   // Higher than kernel
 
-/// Kernel stack size in words (256 bytes)
+// Additional Constants for Embedded System
+pub const configCPU_CLOCK_HZ: u32 = 84_000_000;
+pub const configTICK_RATE_HZ: u32 = 1000;
+
+// Stack size constants
+pub const TASK_STACK_SIZE_WORDS: usize = configMINIMAL_STACK_SIZE;
 pub const KERNEL_STACK_SIZE_WORDS: usize = 64;
+pub const TASK_STACK_SIZE_BYTES: usize = TASK_STACK_SIZE_WORDS * 4;
 
-/// Software context size (r4-r11, LR)
-pub const SW_CONTEXT_SIZE: usize = 9;
-
-/// Hardware context size (r0-r3, r12, lr, pc, xpsr)
-pub const HW_CONTEXT_SIZE: usize = 8;
-
-/// Total context size without FPU
-pub const TOTAL_CONTEXT_SIZE: usize = SW_CONTEXT_SIZE + HW_CONTEXT_SIZE;
-
-/// Stack guard size (in words)
-pub const STACK_GUARD_SIZE: usize = 4;
-
-/// Stack guard pattern for overflow detection
+// Context size constants
+pub const SW_CONTEXT_SIZE: usize = 8;  // Software context (R4-R11)
+pub const HW_CONTEXT_SIZE: usize = 8;  // Hardware context (R0-R3, R12, LR, PC, xPSR)
+pub const STACK_GUARD_SIZE: usize = 4;  // Guard words
 pub const STACK_GUARD_PATTERN: u32 = 0xDEADBEEF;
 
-/// CPU cycles per millisecond
-pub const CYCLES_PER_MS: u32 = SYSTEM_CLOCK_HZ / 1000;
-
-/// Memory layout
-pub const SRAM_START: u32 = 0x2000_0000;
+// Memory layout constants
+pub const SRAM_START: u32 = 0x20000000;
 pub const SRAM_SIZE: u32 = 128 * 1024; // 128KB
 pub const SRAM_END: u32 = SRAM_START + SRAM_SIZE;
+pub const APP_STACK_START: u32 = SRAM_START + 0x8000; // Start app stacks at 32KB offset
 
-/// Dedicated memory regions for MSP/PSP separation
-/// Memory layout: [Kernel Stack (MSP)] [OS Data] [Task1 PSP] [Task2 PSP] [Task3 PSP]
-pub const KERNEL_STACK_SIZE_BYTES: u32 = KERNEL_STACK_SIZE_WORDS as u32 * 4;
-pub const TASK_STACK_SIZE_BYTES: u32 = TASK_STACK_SIZE_WORDS as u32 * 4;
+// System control constants
+pub const SCB_SHPR3: u32 = 0xE000ED20;
+pub const PENDSV_PRIORITY: u32 = 0xFF;
+pub const SYSTICK_PRIORITY: u32 = 0xFF;
+pub const SYSTICK_RELOAD_10MS: u32 = (configCPU_CLOCK_HZ / 100) - 1; // 10ms ticks
 
-/// Kernel stack region (MSP) - starts at SRAM_START
-pub const KERNEL_STACK_START: u32 = SRAM_START;
-pub const KERNEL_STACK_END: u32 = KERNEL_STACK_START + KERNEL_STACK_SIZE_BYTES;
 
-/// OS data region (ProcessManager, etc.)
-pub const OS_DATA_START: u32 = KERNEL_STACK_END;
-pub const OS_DATA_SIZE: u32 = 2048; // 2KB for OS data structures
-pub const OS_DATA_END: u32 = OS_DATA_START + OS_DATA_SIZE;
+/// Stack canary for overflow detection
+pub const STACK_CANARY_VALUE: u32 = 0xDEADBEEF;
 
-/// Application stack region (PSP) - each task gets its own region
-pub const APP_STACK_START: u32 = OS_DATA_END;
-pub const TOTAL_APP_STACK_SIZE: u32 = MAX_TASKS as u32 * TASK_STACK_SIZE_BYTES;
-pub const APP_STACK_END: u32 = APP_STACK_START + TOTAL_APP_STACK_SIZE;
+/// FreeRTOS return codes
+pub const pdTRUE: BaseType_t = 1;
+pub const pdFALSE: BaseType_t = 0;
+pub const pdPASS: BaseType_t = 1;
+pub const pdFAIL: BaseType_t = 0;
 
-/// Interrupt priorities
-pub const PENDSV_PRIORITY: u8 = 0xFF; // Lowest priority
-pub const SYSTICK_PRIORITY: u8 = 0xFE;
+/// Special delay value
+pub const portMAX_DELAY: TickType_t = 0xFFFFFFFF;
 
-/// SysTick reload value for 10ms period
-pub const SYSTICK_RELOAD_10MS: u32 = (SYSTEM_CLOCK_HZ / 100) - 1;
+// ===== FreeRTOS-Style Type Definitions =====
 
-/// Time slice per task in milliseconds
-pub const TIME_SLICE_MS: u32 = 10;
+/// Stack type for ARM Cortex-M4 (32-bit)
+pub type StackType_t = u32;
+
+/// Base type for ARM (32-bit long)
+pub type BaseType_t = i32;
+
+/// Unsigned base type
+pub type UBaseType_t = u32;
+
+/// Tick type (32-bit for our config)
+pub type TickType_t = u32;
+
+/// Task function pointer type
+pub type TaskFunction_t = unsafe extern "C" fn(*mut c_void) -> !;
+
+/// Task handle (pointer to TCB)
+pub type TaskHandle_t = *mut c_void;
+
+// ===== FreeRTOS-Style Enumerations =====
+
+/// Task states (following FreeRTOS eTaskState)
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(C)]
+pub enum eTaskState {
+    eRunning = 0,      // A task is querying the state of itself, so must be running
+    eReady,            // The task being queried is in a ready list
+    eBlocked,          // The task being queried is in the Blocked state
+    eSuspended,        // The task being queried is in the Suspended state
+    eDeleted,          // The task being queried has been deleted
+    eInvalid,          // Used as an 'invalid state' value
+}
+
+/// Task notification states
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(C)]
+pub enum eNotifyState {
+    eNotWaitingNotification = 0,
+    eWaitingNotification,
+}
+
+// ===== FreeRTOS-Style List Structures =====
+
+/// Mini list item (for list end marker)
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct MiniListItem_t {
+    pub item_value: TickType_t,
+    pub p_next: *mut ListItem_t,
+    pub p_previous: *mut ListItem_t,
+}
+
+impl MiniListItem_t {
+    pub const fn new() -> Self {
+        Self {
+            item_value: 0,
+            p_next: core::ptr::null_mut(),
+            p_previous: core::ptr::null_mut(),
+        }
+    }
+}
+
+/// List item structure (following FreeRTOS ListItem_t)
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct ListItem_t {
+    pub item_value: TickType_t,
+    pub p_next: *mut ListItem_t,
+    pub p_previous: *mut ListItem_t,
+    pub p_owner: *mut c_void,
+    pub p_container: *mut List_t,
+}
+
+impl ListItem_t {
+    pub const fn new() -> Self {
+        Self {
+            item_value: 0,
+            p_next: core::ptr::null_mut(),
+            p_previous: core::ptr::null_mut(),
+            p_owner: core::ptr::null_mut(),
+            p_container: core::ptr::null_mut(),
+        }
+    }
+}
+
+/// List structure (following FreeRTOS List_t)
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct List_t {
+    pub number_of_items: UBaseType_t,
+    pub p_index: *mut ListItem_t,
+    pub end: MiniListItem_t,
+}
+
+impl List_t {
+    pub const fn new() -> Self {
+        Self {
+            number_of_items: 0,
+            p_index: core::ptr::null_mut(),
+            end: MiniListItem_t::new(),
+        }
+    }
+}
+
+// ===== FreeRTOS-Style Task Control Block =====
+
+/// Task Control Block (following FreeRTOS tskTCB structure)
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct tskTCB {
+    /// Task's stack pointer - MUST BE FIRST FIELD (ARM requirement)
+    pub p_top_of_stack: *mut StackType_t,
+
+    /// Generic list item for ready/blocked lists
+    pub generic_list_item: ListItem_t,
+
+    /// Event list item for event-based blocking
+    pub event_list_item: ListItem_t,
+
+    /// Task priority (0 = lowest)
+    pub priority: UBaseType_t,
+
+    /// Pointer to start of stack
+    pub p_stack: *mut StackType_t,
+
+    /// Task name for debugging
+    pub task_name: [u8; configMAX_TASK_NAME_LEN],
+
+    /// Stack size in words
+    pub stack_depth: u16,
+
+    /// Task number for trace facility
+    pub task_number: UBaseType_t,
+
+    /// Base priority (for priority inheritance)
+    pub base_priority: UBaseType_t,
+
+    /// Mutex held count (for priority inheritance)
+    pub mutexes_held: UBaseType_t,
+
+    /// Task notification value
+    pub notification_value: u32,
+
+    /// Task notification state
+    pub notification_state: eNotifyState,
+}
+
+impl tskTCB {
+    pub const fn new() -> Self {
+        Self {
+            p_top_of_stack: core::ptr::null_mut(),
+            generic_list_item: ListItem_t::new(),
+            event_list_item: ListItem_t::new(),
+            priority: 0,
+            p_stack: core::ptr::null_mut(),
+            task_name: [0; configMAX_TASK_NAME_LEN],
+            stack_depth: 0,
+            task_number: 0,
+            base_priority: 0,
+            mutexes_held: 0,
+            notification_value: 0,
+            notification_state: eNotifyState::eNotWaitingNotification,
+        }
+    }
+}
+
+// ===== FreeRTOS-Style List Management Functions =====
+
+/// Initialize a list (following FreeRTOS vListInitialise)
+unsafe fn v_list_initialise(p_list: *mut List_t) {
+    unsafe {
+        // The list end item value is the maximum possible value for a TickType_t
+        (*p_list).end.item_value = portMAX_DELAY;
+
+        // The list end item's previous and next pointers point to itself
+        (*p_list).end.p_next = &raw mut (*p_list).end as *mut MiniListItem_t as *mut ListItem_t;
+        (*p_list).end.p_previous = &raw mut (*p_list).end as *mut MiniListItem_t as *mut ListItem_t;
+
+        // Initialize the list end item as the index
+        (*p_list).p_index = &raw mut (*p_list).end as *mut MiniListItem_t as *mut ListItem_t;
+
+        // No items in the list yet
+        (*p_list).number_of_items = 0;
+    }
+}
+
+/// Insert a list item at the end of a list (following FreeRTOS vListInsertEnd)
+unsafe fn v_list_insert_end(p_list: *mut List_t, p_new_list_item: *mut ListItem_t) {
+    unsafe {
+        let p_index = (*p_list).p_index;
+
+        // The new list item goes between the index and the item before the index
+        (*p_new_list_item).p_next = p_index;
+        (*p_new_list_item).p_previous = (*p_index).p_previous;
+
+        // Update the links
+        (*(*p_index).p_previous).p_next = p_new_list_item;
+        (*p_index).p_previous = p_new_list_item;
+
+        // The new item belongs to this list
+        (*p_new_list_item).p_container = p_list;
+
+        // Increment the number of items
+        (*p_list).number_of_items += 1;
+    }
+}
+
+/// Insert a list item in the correct position based on its value (following FreeRTOS vListInsert)
+unsafe fn v_list_insert(p_list: *mut List_t, p_new_list_item: *mut ListItem_t) {
+    unsafe {
+        let value_of_insertion = (*p_new_list_item).item_value;
+
+        // Special case: if the value is portMAX_DELAY, insert at the end
+        if value_of_insertion == portMAX_DELAY {
+            let p_iterator = (*p_list).end.p_previous as *mut ListItem_t;
+            (*p_new_list_item).p_next = &raw mut (*p_list).end as *mut MiniListItem_t as *mut ListItem_t;
+            (*p_new_list_item).p_previous = p_iterator;
+            (*p_iterator).p_next = p_new_list_item;
+            (*p_list).end.p_previous = p_new_list_item as *mut ListItem_t;
+        } else {
+            // Find the correct position in the list
+            let mut p_iterator = &raw mut (*p_list).end as *mut MiniListItem_t as *mut ListItem_t;
+
+            loop {
+                p_iterator = (*p_iterator).p_next;
+                if (*p_iterator).item_value >= value_of_insertion {
+                    break;
+                }
+            }
+
+            // Insert the new item before the iterator
+            (*p_new_list_item).p_next = p_iterator;
+            (*p_new_list_item).p_previous = (*p_iterator).p_previous;
+            (*(*p_iterator).p_previous).p_next = p_new_list_item;
+            (*p_iterator).p_previous = p_new_list_item;
+        }
+
+        // The new item belongs to this list
+        (*p_new_list_item).p_container = p_list;
+
+        // Increment the number of items
+        (*p_list).number_of_items += 1;
+    }
+}
+
+/// Remove a list item from its container list (following FreeRTOS uxListRemove)
+unsafe fn ux_list_remove(p_item_to_remove: *mut ListItem_t) -> UBaseType_t {
+    unsafe {
+        let p_list = (*p_item_to_remove).p_container;
+
+        // Remove the item from the list
+        (*(*p_item_to_remove).p_next).p_previous = (*p_item_to_remove).p_previous;
+        (*(*p_item_to_remove).p_previous).p_next = (*p_item_to_remove).p_next;
+
+        // If the list index was pointing to this item, move it to the previous item
+        if (*p_list).p_index == p_item_to_remove {
+            (*p_list).p_index = (*p_item_to_remove).p_previous;
+        }
+
+        // The item is no longer in any list
+        (*p_item_to_remove).p_container = core::ptr::null_mut();
+
+        // Decrement the number of items and return the new count
+        (*p_list).number_of_items -= 1;
+        (*p_list).number_of_items
+    }
+}
+
+/// Check if a list is empty (following FreeRTOS listIS_EMPTY)
+#[inline(always)]
+unsafe fn list_is_empty(p_list: *const List_t) -> bool {
+    unsafe {
+        (*p_list).number_of_items == 0
+    }
+}
+
+/// Get the head entry of a list (following FreeRTOS listGET_HEAD_ENTRY)
+#[inline(always)]
+unsafe fn list_get_head_entry(p_list: *const List_t) -> *mut ListItem_t {
+    unsafe {
+        (*p_list).end.p_next
+    }
+}
+
+/// Get the owner of a list item (following FreeRTOS listGET_LIST_ITEM_OWNER)
+#[inline(always)]
+unsafe fn list_get_list_item_owner(p_list_item: *const ListItem_t) -> *mut c_void {
+    unsafe {
+        (*p_list_item).p_owner
+    }
+}
+
+/// Set the owner of a list item (following FreeRTOS listSET_LIST_ITEM_OWNER)
+#[inline(always)]
+unsafe fn list_set_list_item_owner(p_list_item: *mut ListItem_t, p_owner: *mut c_void) {
+    unsafe {
+        (*p_list_item).p_owner = p_owner;
+    }
+}
+
+/// Get the value of a list item (following FreeRTOS listGET_LIST_ITEM_VALUE)
+#[inline(always)]
+unsafe fn list_get_list_item_value(p_list_item: *const ListItem_t) -> TickType_t {
+    unsafe {
+        (*p_list_item).item_value
+    }
+}
+
+/// Set the value of a list item (following FreeRTOS listSET_LIST_ITEM_VALUE)
+#[inline(always)]
+unsafe fn list_set_list_item_value(p_list_item: *mut ListItem_t, item_value: TickType_t) {
+    unsafe {
+        (*p_list_item).item_value = item_value;
+    }
+}
+
+// ===== Hardware Constants =====
+
+/// ARM Cortex-M4 initial stack pointer and exception return values
+pub const PORT_INITIAL_XPSR: StackType_t = 0x01000000; // Thumb state bit set
+pub const PORT_START_ADDRESS_MASK: StackType_t = 0xFFFFFFFE;
+
+/// SysTick configuration
+pub const TIME_SLICE_MS: u32 = 1000 / configTICK_RATE_HZ;
+
+// ===== FreeRTOS-Style Static Memory Allocation =====
+
+/// Global scheduler state variables
+static mut UX_SCHEDULER_RUNNING: BaseType_t = pdFALSE;
+static mut UX_CURRENT_NUMBER_OF_TASKS: UBaseType_t = 0;
+static mut UX_TICK_COUNT: TickType_t = 0;
+static mut UX_YIELD_PENDING: BaseType_t = pdFALSE;
+static mut UX_NUM_OF_OVERFLOWS: BaseType_t = 0;
+static mut UX_NEXT_TASK_UNBLOCK_TIME: TickType_t = 0;
+
+/// Current task pointer (must match assembly expectations)
+static mut PX_CURRENT_TCB: *mut tskTCB = core::ptr::null_mut();
+
+/// Ready task lists - one for each priority level (following FreeRTOS pattern)
+static mut PX_READY_TASK_LISTS: [List_t; configMAX_PRIORITIES] = [List_t::new(); configMAX_PRIORITIES];
+
+/// Delayed task lists (for vTaskDelay)
+static mut X_DELAYED_TASK_LIST1: List_t = List_t::new();
+static mut X_DELAYED_TASK_LIST2: List_t = List_t::new();
+static mut PX_DELAYED_TASK_LIST: *mut List_t = core::ptr::null_mut();
+static mut PX_OVERFLOW_DELAYED_TASK_LIST: *mut List_t = core::ptr::null_mut();
+
+/// Suspended task list
+static mut X_SUSPENDED_TASK_LIST: List_t = List_t::new();
+
+/// Task stacks - statically allocated (following static allocation pattern)
+static mut TASK_STACKS: [[StackType_t; configMINIMAL_STACK_SIZE]; MAX_TASKS] =
+    [[0; configMINIMAL_STACK_SIZE]; MAX_TASKS];
+
+/// Task Control Blocks - statically allocated
+static mut TASK_TCBS: [tskTCB; MAX_TASKS] = [tskTCB::new(); MAX_TASKS];
+
+/// Idle task stack and TCB
+static mut IDLE_TASK_STACK: [StackType_t; configMINIMAL_STACK_SIZE] = [0; configMINIMAL_STACK_SIZE];
+static mut IDLE_TASK_TCB: tskTCB = tskTCB::new();
+
+/// Critical nesting counter for interrupt management
+static mut UX_CRITICAL_NESTING: UBaseType_t = 0;
+
+/// Task counter for unique task numbers
+static mut UX_TASK_NUMBER: UBaseType_t = 0;
 
 // ===== EXC_RETURN Values =====
 
@@ -88,13 +455,20 @@ pub const EXC_RETURN_THREAD_PSP: u32 = 0xFFFFFFFD;
 /// EXC_RETURN for Thread mode, MSP
 pub const EXC_RETURN_THREAD_MSP: u32 = 0xFFFFFFF9;
 
-// ===== Register Addresses =====
+// ===== ARM Cortex-M Hardware Registers (Following FreeRTOS Port) =====
 
-/// NVIC ICSR register
-pub const NVIC_ICSR: u32 = 0xE000_ED04;
+/// System Control Block (SCB) registers
+pub const PORT_SCB_BASE: u32 = 0xE000ED00;
+pub const PORT_SCB_ICSR: *mut u32 = (PORT_SCB_BASE + 0x04) as *mut u32;
+pub const PORT_SCB_VTOR: *mut u32 = (PORT_SCB_BASE + 0x08) as *mut u32;
+pub const PORT_SCB_AIRCR: *mut u32 = (PORT_SCB_BASE + 0x0C) as *mut u32;
+pub const PORT_SCB_SHPR3: *mut u32 = (PORT_SCB_BASE + 0x20) as *mut u32;
 
-/// SCB SHPR3 register
-pub const SCB_SHPR3: u32 = 0xE000_ED20;
+/// NVIC interrupt control
+pub const PORT_NVIC_PENDSVSET_BIT: u32 = 0x10000000;
+pub const PORT_NVIC_PENDSVCLR_BIT: u32 = 0x08000000;
+pub const PORT_NVIC_PEND_SYSTICK_SET_BIT: u32 = 0x04000000;
+pub const PORT_NVIC_PEND_SYSTICK_CLEAR_BIT: u32 = 0x02000000;
 
 /// SysTick registers
 pub const SYSTICK_CSR: u32 = 0xE000_E010;
@@ -818,8 +1192,8 @@ pub unsafe fn initialize_msp_psp_separation() {
 
 /// Get dedicated stack region for task
 pub fn get_task_stack_region(task_id: usize) -> (u32, u32) {
-    let stack_start = APP_STACK_START + (task_id as u32 * TASK_STACK_SIZE_BYTES);
-    let stack_end = stack_start + TASK_STACK_SIZE_BYTES;
+    let stack_start = APP_STACK_START + (task_id as u32 * TASK_STACK_SIZE_BYTES as u32);
+    let stack_end = stack_start + TASK_STACK_SIZE_BYTES as u32;
     (stack_start, stack_end)
 }
 
@@ -956,80 +1330,496 @@ pub extern "C" fn pendsv_switch_handler(old_psp: u32) -> u32 {
     }
 }
 
+// ===== FreeRTOS-Style PendSV Handler (ARM Cortex-M4) =====
+
 global_asm!(
     r#"
-    .global PendSV
-    .type   PendSV, %function
+    .syntax unified
     .thumb
+    .text
+
+    .global PendSV_Handler
+    .type   PendSV_Handler, %function
     .thumb_func
+
 PendSV_Handler:
-    /* Cortex-M PendSV_Handler (FreeRTOS-style, no FPU) */
-
-    /* LED ON to indicate PendSV entry */
-    ldr     r1, =0x40020018     /* GPIOA_BSRR */
-    mov     r2, #32             /* Set bit 5 (LED ON) */
-    str     r2, [r1]            /* GIOPA_BSRR 레지스터에 LED_ON 값을 넣어주는 역할 */
-
-    /* Save current PSP into r0 */
+    /* Disable interrupts during context switch */
     mrs     r0, psp
-
-    /* Check first switch (PSP == 0) */
-    /* Compare and Branch on Zero : r0 == 0이면 first_task 레이블로 분기. 첫 태스크 실행 전 PSP가 0일 때 사용. */
-    cbz     r0, first_task_switch   
-
-    /* NORMAL TASK SWITCH */
-normal_task_switch:
-    /* Save callee-saved registers + LR */
-    stmdb   r0!, {{r4-r11, r14}}
-
-    /* Call Rust handler */
-    bl      {0}     /* cur PC +  4를 LR에 저장 -> 함수 호출처럼 동작 */
-
-    /* Restore callee-saved registers + LR */
-    ldmia   r0!, {{r4-r11, r14}}
-
-    /* Update PSP to point to HW context */
-    msr     psp, r0
-
-    /* Exception return: CPU will restore HW context */
-    bx      lr
-
-    /* FIRST TASK SWITCH */
-first_task_switch:
-    /* Ask Rust handler for first task PSP */
-    bl      {0}
-
-    /* r0 = PSP of first task (points to HW context) */
-    msr     psp, r0
-
-    /* Configure CONTROL: use PSP in Thread mode */
-    mrs     r1, CONTROL
-    orr     r1, r1, #0x02   /* SPSEL: use PSP */
-    msr     CONTROL, r1
     isb
 
-    /* Return with EXC_RETURN for Thread+PSP (no FPU) */
-    ldr     lr, =0xFFFFFFFD
-    bx      lr
+    /* Get current task's TCB address */
+    ldr     r3, =pxCurrentTCB
+    ldr     r2, [r3]
+
+    /* Check if this is the first task (pxCurrentTCB == NULL) */
+    cmp     r2, #0
+    beq     restore_first_task
+
+    /* Save remaining core registers (r4-r11) on process stack */
+    stmdb   r0!, {{r4-r11}}
+
+    /* Save the new top of stack into the TCB */
+    str     r0, [r2]
+
+save_context_complete:
+    /* Call vTaskSwitchContext to select next task */
+    stmdb   sp!, {{r3, r14}}
+    mov     r0, #191
+    msr     basepri, r0
+    dsb
+    isb
+    bl      vTaskSwitchContext
+    mov     r0, #0
+    msr     basepri, r0
+    ldmia   sp!, {{r3, r14}}
+
+    /* Load the new current TCB */
+    ldr     r1, [r3]
+    ldr     r0, [r1]
+
+restore_first_task:
+    /* Restore core registers (r4-r11) */
+    ldmia   r0!, {{r4-r11}}
+
+    /* Update PSP */
+    msr     psp, r0
+    isb
+
+    /* Return to task */
+    bx      r14
 "#,
-    sym pendsv_switch_handler
 );
 
+// ===== FreeRTOS-Style Critical Section Management =====
 
+/// Enter critical section (following FreeRTOS portENTER_CRITICAL)
+#[inline(always)]
+unsafe fn port_enter_critical() {
+    unsafe {
+        port_disable_interrupts();
+        UX_CRITICAL_NESTING += 1;
+        core::arch::asm!("dsb", "isb", options(nomem, nostack));
+    }
+}
+
+/// Exit critical section (following FreeRTOS portEXIT_CRITICAL)
+#[inline(always)]
+unsafe fn port_exit_critical() {
+    unsafe {
+        UX_CRITICAL_NESTING = UX_CRITICAL_NESTING.saturating_sub(1);
+        if UX_CRITICAL_NESTING == 0 {
+            port_enable_interrupts();
+        }
+    }
+}
+
+/// Disable interrupts (following FreeRTOS portmacro.h)
+#[inline(always)]
+unsafe fn port_disable_interrupts() {
+    unsafe {
+        core::arch::asm!(
+            "mov r0, #191",
+            "msr basepri, r0",
+            "dsb",
+            "isb",
+            out("r0") _,
+            options(nomem, nostack)
+        );
+    }
+}
+
+/// Enable interrupts (following FreeRTOS portmacro.h)
+#[inline(always)]
+unsafe fn port_enable_interrupts() {
+    unsafe {
+        core::arch::asm!(
+            "mov r0, #0",
+            "msr basepri, r0",
+            out("r0") _,
+            options(nomem, nostack)
+        );
+    }
+}
+
+/// Yield the processor (following FreeRTOS portYIELD)
+#[inline(always)]
+unsafe fn port_yield() {
+    unsafe {
+        // Set PendSV interrupt pending
+        core::ptr::write_volatile(PORT_SCB_ICSR, PORT_NVIC_PENDSVSET_BIT);
+        // Memory barrier to ensure write completes
+        core::arch::asm!("dsb", "isb", options(nomem, nostack));
+    }
+}
+
+// ===== FreeRTOS-Style Task Switching Functions =====
+
+/// Context switching function called by PendSV handler (following FreeRTOS vTaskSwitchContext)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vTaskSwitchContext() {
+    unsafe {
+        if UX_SCHEDULER_RUNNING != pdFALSE {
+            // Check if a yield is pending
+            UX_YIELD_PENDING = pdFALSE;
+
+            // Find the highest priority ready task
+            prv_get_highest_priority_ready_task();
+        }
+    }
+}
+
+/// Get the highest priority ready task (following FreeRTOS task selection logic)
+unsafe fn prv_get_highest_priority_ready_task() {
+    unsafe {
+        // Find the highest priority with a ready task
+        for priority in (0..configMAX_PRIORITIES).rev() {
+            if !list_is_empty(&PX_READY_TASK_LISTS[priority]) {
+                let list_item = list_get_head_entry(&PX_READY_TASK_LISTS[priority]);
+                let new_tcb = list_get_list_item_owner(list_item) as *mut tskTCB;
+
+                // Switch to the new task if different from current
+                if new_tcb != PX_CURRENT_TCB {
+                    PX_CURRENT_TCB = new_tcb;
+                }
+                return;
+            }
+        }
+
+        // If no ready tasks found, use idle task
+        PX_CURRENT_TCB = &raw mut IDLE_TASK_TCB;
+    }
+}
+
+/// Stack initialization function (following FreeRTOS pxPortInitialiseStack)
+unsafe fn px_port_initialise_stack(
+    p_top_of_stack: *mut StackType_t,
+    p_code: TaskFunction_t,
+    p_parameters: *mut c_void,
+) -> *mut StackType_t {
+    unsafe {
+        let mut p_top_of_stack = p_top_of_stack;
+
+        // Simulate the stack frame as it would be created by a context switch interrupt
+        // The order matches what the hardware pushes onto the stack automatically
+
+        // Simulate hardware stack frame (automatically saved by Cortex-M)
+        p_top_of_stack = p_top_of_stack.offset(-1);
+        *p_top_of_stack = PORT_INITIAL_XPSR; // xPSR
+
+        p_top_of_stack = p_top_of_stack.offset(-1);
+        *p_top_of_stack = (p_code as usize as StackType_t) & PORT_START_ADDRESS_MASK; // PC
+
+        p_top_of_stack = p_top_of_stack.offset(-1);
+        *p_top_of_stack = 0; // LR (R14)
+
+        p_top_of_stack = p_top_of_stack.offset(-1);
+        *p_top_of_stack = 0; // R12
+
+        p_top_of_stack = p_top_of_stack.offset(-1);
+        *p_top_of_stack = 0; // R3
+
+        p_top_of_stack = p_top_of_stack.offset(-1);
+        *p_top_of_stack = 0; // R2
+
+        p_top_of_stack = p_top_of_stack.offset(-1);
+        *p_top_of_stack = 0; // R1
+
+        p_top_of_stack = p_top_of_stack.offset(-1);
+        *p_top_of_stack = p_parameters as usize as StackType_t; // R0 (first parameter)
+
+        // Simulate software stack frame (manually saved by PendSV)
+        // This matches the stmdb instruction in PendSV_Handler
+        p_top_of_stack = p_top_of_stack.offset(-1);
+        *p_top_of_stack = 0; // R11
+
+        p_top_of_stack = p_top_of_stack.offset(-1);
+        *p_top_of_stack = 0; // R10
+
+        p_top_of_stack = p_top_of_stack.offset(-1);
+        *p_top_of_stack = 0; // R9
+
+        p_top_of_stack = p_top_of_stack.offset(-1);
+        *p_top_of_stack = 0; // R8
+
+        p_top_of_stack = p_top_of_stack.offset(-1);
+        *p_top_of_stack = 0; // R7
+
+        p_top_of_stack = p_top_of_stack.offset(-1);
+        *p_top_of_stack = 0; // R6
+
+        p_top_of_stack = p_top_of_stack.offset(-1);
+        *p_top_of_stack = 0; // R5
+
+        p_top_of_stack = p_top_of_stack.offset(-1);
+        *p_top_of_stack = 0; // R4
+
+        p_top_of_stack
+    }
+}
+
+// ===== FreeRTOS-Style Task Management =====
+
+/// Create a new task (following FreeRTOS xTaskCreate)
+pub unsafe fn x_task_create(
+    p_task_code: TaskFunction_t,
+    task_name: &str,
+    stack_depth: u16,
+    p_parameters: *mut c_void,
+    priority: UBaseType_t,
+    p_created_task: *mut TaskHandle_t,
+) -> BaseType_t {
+    unsafe {
+        let mut return_value = pdFAIL;
+
+        // Ensure we don't exceed maximum tasks
+        if UX_CURRENT_NUMBER_OF_TASKS < MAX_TASKS as UBaseType_t {
+            let task_index = UX_CURRENT_NUMBER_OF_TASKS as usize;
+            let p_new_tcb = &raw mut TASK_TCBS[task_index];
+
+            // Initialize the stack
+            let p_stack = core::ptr::addr_of_mut!(TASK_STACKS[task_index]) as *mut StackType_t;
+            let p_stack_end = p_stack.add(configMINIMAL_STACK_SIZE - 1);
+
+            // Initialize the TCB
+            prv_initialise_tcb(
+                p_new_tcb,
+                task_name,
+                priority,
+                p_stack,
+                stack_depth,
+            );
+
+            // Initialize the stack for the task
+            (*p_new_tcb).p_top_of_stack = px_port_initialise_stack(
+                p_stack_end,
+                p_task_code,
+                p_parameters,
+            );
+
+            if !p_created_task.is_null() {
+                *p_created_task = p_new_tcb as *mut tskTCB as *mut c_void;
+            }
+
+            // Add task to the ready list
+            prv_add_new_task_to_ready_list(p_new_tcb);
+
+            return_value = pdPASS;
+            UX_CURRENT_NUMBER_OF_TASKS += 1;
+
+            rprintln!("[TASK] Created task '{}' priority {} stack {:?}",
+                      task_name, priority, (*p_new_tcb).p_top_of_stack);
+        } else {
+            rprintln!("[ERROR] Maximum number of tasks reached");
+        }
+
+        return_value
+    }
+}
+
+/// Initialize TCB with basic values (following FreeRTOS prvInitialiseTCBVariables)
+unsafe fn prv_initialise_tcb(
+    p_tcb: *mut tskTCB,
+    task_name: &str,
+    priority: UBaseType_t,
+    p_stack: *mut StackType_t,
+    stack_depth: u16,
+) {
+    unsafe {
+        // Initialize the list items
+        list_set_list_item_owner(&raw mut (*p_tcb).generic_list_item, p_tcb as *mut c_void);
+        list_set_list_item_value(&raw mut (*p_tcb).generic_list_item, configMAX_PRIORITIES as TickType_t - priority as TickType_t);
+
+        list_set_list_item_owner(&raw mut (*p_tcb).event_list_item, p_tcb as *mut c_void);
+        list_set_list_item_value(&raw mut (*p_tcb).event_list_item, configMAX_PRIORITIES as TickType_t - priority as TickType_t);
+
+        // Set priority
+        (*p_tcb).priority = priority;
+        (*p_tcb).base_priority = priority;
+
+        // Copy task name
+        let name_bytes = task_name.as_bytes();
+        let copy_length = core::cmp::min(name_bytes.len(), configMAX_TASK_NAME_LEN - 1);
+        (&mut (*p_tcb).task_name)[..copy_length].copy_from_slice(&name_bytes[..copy_length]);
+        (*p_tcb).task_name[copy_length] = 0; // Null terminator
+
+        // Stack information
+        (*p_tcb).p_stack = p_stack;
+        (*p_tcb).stack_depth = stack_depth;
+
+        // Task number for tracing
+        (*p_tcb).task_number = UX_TASK_NUMBER;
+        UX_TASK_NUMBER += 1;
+
+        // Initialize notification state
+        (*p_tcb).notification_state = eNotifyState::eNotWaitingNotification;
+        (*p_tcb).notification_value = 0;
+    }
+}
+
+/// Add a new task to the ready list (following FreeRTOS prvAddNewTaskToReadyList)
+unsafe fn prv_add_new_task_to_ready_list(p_new_tcb: *mut tskTCB) {
+    unsafe {
+        port_enter_critical();
+        {
+            let priority = (*p_new_tcb).priority;
+
+            // Add the task to the ready list for its priority
+            v_list_insert_end(&raw mut PX_READY_TASK_LISTS[priority as usize], &raw mut (*p_new_tcb).generic_list_item);
+
+            rprintln!("[SCHEDULER] Added task to ready list priority {}", priority);
+
+            // If this is the first task or the scheduler is not running yet,
+            // and this task has higher priority than current, make it current
+            if UX_CURRENT_NUMBER_OF_TASKS == 1 || PX_CURRENT_TCB.is_null() {
+                PX_CURRENT_TCB = p_new_tcb;
+                rprintln!("[SCHEDULER] Set as current task");
+            }
+        }
+        port_exit_critical();
+    }
+}
+
+/// FreeRTOS-style tick increment function
+pub unsafe fn x_task_increment_tick() -> BaseType_t {
+    // For now, just return pdTRUE to always force context switch on each tick
+    // In full FreeRTOS, this would handle delays, timeouts, etc.
+    pdTRUE
+}
+
+pub unsafe fn v_task_start_scheduler() {
+    unsafe {
+        // Create the idle task
+        prv_create_idle_task();
+
+        // Initialize the scheduler lists
+        prv_initialise_task_lists();
+
+        // Set up the hardware for context switching
+        if px_port_start_scheduler() == pdTRUE {
+            // The scheduler has started successfully
+            UX_SCHEDULER_RUNNING = pdTRUE;
+        } else {
+            // Failed to start scheduler
+            rprintln!("[ERROR] Failed to start scheduler");
+        }
+    }
+}
+
+/// Initialize the task lists (following FreeRTOS prvInitialiseTaskLists)
+unsafe fn prv_initialise_task_lists() {
+    unsafe {
+        // Initialize ready lists for each priority
+        for i in 0..configMAX_PRIORITIES {
+            v_list_initialise(&raw mut PX_READY_TASK_LISTS[i]);
+        }
+
+        // Initialize delayed task lists
+        v_list_initialise(&raw mut X_DELAYED_TASK_LIST1);
+        v_list_initialise(&raw mut X_DELAYED_TASK_LIST2);
+        v_list_initialise(&raw mut X_SUSPENDED_TASK_LIST);
+
+        // Set up delayed list pointers
+        PX_DELAYED_TASK_LIST = &raw mut X_DELAYED_TASK_LIST1;
+        PX_OVERFLOW_DELAYED_TASK_LIST = &raw mut X_DELAYED_TASK_LIST2;
+
+        rprintln!("[SCHEDULER] Task lists initialized");
+    }
+}
+
+/// Create the idle task (following FreeRTOS prvCreateIdleTask)
+unsafe fn prv_create_idle_task() {
+    unsafe {
+        // Initialize idle task name
+        let idle_name = "IDLE\0";
+        let name_bytes = idle_name.as_bytes();
+        IDLE_TASK_TCB.task_name[..name_bytes.len()].copy_from_slice(name_bytes);
+
+        // Set up idle task
+        IDLE_TASK_TCB.priority = 0; // Lowest priority
+        IDLE_TASK_TCB.base_priority = 0;
+        IDLE_TASK_TCB.p_stack = core::ptr::addr_of_mut!(IDLE_TASK_STACK) as *mut StackType_t;
+        IDLE_TASK_TCB.stack_depth = configMINIMAL_STACK_SIZE as u16;
+
+        // Initialize idle task stack
+        let p_stack_end = (core::ptr::addr_of_mut!(IDLE_TASK_STACK) as *mut StackType_t).add(configMINIMAL_STACK_SIZE - 1);
+        IDLE_TASK_TCB.p_top_of_stack = px_port_initialise_stack(
+            p_stack_end,
+            prv_idle_task,
+            core::ptr::null_mut(),
+        );
+
+        // Set up list items
+        list_set_list_item_owner(&raw mut IDLE_TASK_TCB.generic_list_item, &raw mut IDLE_TASK_TCB as *mut tskTCB as *mut c_void);
+        list_set_list_item_value(&raw mut IDLE_TASK_TCB.generic_list_item, 0); // Lowest priority
+
+        list_set_list_item_owner(&raw mut IDLE_TASK_TCB.event_list_item, &raw mut IDLE_TASK_TCB as *mut tskTCB as *mut c_void);
+
+        // Add idle task to ready list
+        v_list_insert_end(&raw mut PX_READY_TASK_LISTS[0], &raw mut IDLE_TASK_TCB.generic_list_item);
+
+        rprintln!("[IDLE] Idle task created");
+    }
+}
+
+/// Idle task function (following FreeRTOS idle task pattern)
+unsafe extern "C" fn prv_idle_task(_p_parameters: *mut c_void) -> ! {
+    unsafe {
+        loop {
+            // Idle task just does nothing and yields
+            // In a full implementation, this could do housekeeping tasks
+            core::arch::asm!("nop");
+            core::arch::asm!("wfi"); // Wait for interrupt to save power
+        }
+    }
+}
+
+/// Start the scheduler (hardware-specific port initialization)
+unsafe fn px_port_start_scheduler() -> BaseType_t {
+    unsafe {
+        // Set interrupt priorities
+        prv_setup_timer_interrupt();
+
+        // Set PendSV and SysTick to the lowest interrupt priority
+        core::ptr::write_volatile(PORT_SCB_SHPR3,
+            (configKERNEL_INTERRUPT_PRIORITY as u32) << 16 | // PendSV
+            (configKERNEL_INTERRUPT_PRIORITY as u32) << 24   // SysTick
+        );
+
+        // Start first task by triggering PendSV
+        if !PX_CURRENT_TCB.is_null() {
+            port_yield();
+            pdTRUE
+        } else {
+            pdFAIL
+        }
+    }
+}
+
+/// Setup timer interrupt (SysTick)
+unsafe fn prv_setup_timer_interrupt() {
+    unsafe {
+        // Configure SysTick for the tick interrupt
+        let reload_value = configCPU_CLOCK_HZ / configTICK_RATE_HZ;
+
+        // Set reload value
+        core::ptr::write_volatile((0xE000E014) as *mut u32, reload_value - 1);
+
+        // Clear current value
+        core::ptr::write_volatile((0xE000E018) as *mut u32, 0);
+
+        // Enable SysTick, use processor clock, enable interrupt
+        core::ptr::write_volatile((0xE000E010) as *mut u32, 0x07);
+
+        rprintln!("[SYSTICK] Configured for {} Hz tick rate", configTICK_RATE_HZ);
+    }
+}
 
 // ===== Tasks =====
 
-/// Task 0: LED control task (Pure Preemptive)
+/// Task 0: LED control task (FreeRTOS-style)
 #[unsafe(no_mangle)]
-pub extern "C" fn task0_entry() -> ! {
-    rprintln!("[TASK0] Starting pure preemptive LED control task");
-
-    // Enable SysTick now that first task has started
-    rprintln!("[TASK0] Enabling SysTick for preemptive scheduling");
-    unsafe {
-        initialize_systick();
-    }
-    rprintln!("[TASK0] SysTick enabled - preemptive multitasking active");
+pub extern "C" fn task0_entry(_parameters: *mut c_void) -> ! {
+    rprintln!("[TASK0] Starting FreeRTOS LED control task - Priority 2");
 
     let mut counter = 0u32;
 
@@ -1053,10 +1843,10 @@ pub extern "C" fn task0_entry() -> ! {
     }
 }
 
-/// Task 1: General purpose task (Pure Preemptive)
+/// Task 1: General purpose task (FreeRTOS-style)
 #[unsafe(no_mangle)]
-pub extern "C" fn task1_entry() -> ! {
-    rprintln!("[TASK1] Starting pure preemptive general task");
+pub extern "C" fn task1_entry(_parameters: *mut c_void) -> ! {
+    rprintln!("[TASK1] Starting FreeRTOS general task - Priority 1");
 
     let mut counter = 0u32;
 
@@ -1080,10 +1870,10 @@ pub extern "C" fn task1_entry() -> ! {
     }
 }
 
-/// Task 2: Background task (Pure Preemptive)
+/// Task 2: Background task (FreeRTOS-style)
 #[unsafe(no_mangle)]
-pub extern "C" fn task2_entry() -> ! {
-    rprintln!("[TASK2] Starting pure preemptive background task");
+pub extern "C" fn task2_entry(_parameters: *mut c_void) -> ! {
+    rprintln!("[TASK2] Starting FreeRTOS background task - Priority 0");
 
     let mut counter = 0u32;
     let mut led_state = false;
@@ -1113,20 +1903,20 @@ pub extern "C" fn task2_entry() -> ! {
 
 // ===== Exception Handlers =====
 
-/// SysTick handler - performs pure preemptive scheduling every 10ms
+/// SysTick handler - performs FreeRTOS-style preemptive scheduling
 #[unsafe(no_mangle)]
 pub extern "C" fn SysTick() {
-    // Get process manager and perform preemptive scheduling
-    let process_mgr = process_manager();
+    // Increment the tick count
+    unsafe {
+        UX_TICK_COUNT = UX_TICK_COUNT.wrapping_add(1);
+    }
 
-    if let Some((current_psp, _next_psp)) = process_mgr.preemptive_schedule() {
-        // A context switch is needed - update current task's PSP first
-        process_mgr.processes[process_mgr.os_state.current_task].stack_pointer = current_psp;
-
-        // Trigger PendSV for actual context switching
+    // Check if we need to context switch to higher priority task
+    // This will be handled by vTaskSwitchContext when PendSV is triggered
+    if unsafe { x_task_increment_tick() } != pdFALSE {
+        // A context switch is needed - trigger PendSV
         trigger_pendsv();
     }
-    // If no context switch needed, just continue with current task
 }
 
 
@@ -1141,7 +1931,7 @@ fn main() -> ! {
         cortex_m::asm::nop();
     }
 
-    rprintln!("[MINI-OS] Booting...");
+    rprintln!("[FREERTOS] Starting FreeRTOS-style embedded OS...");
 
     // Initialize MSP/PSP stack separation
     unsafe {
@@ -1150,263 +1940,84 @@ fn main() -> ! {
     rprintln!("[MAIN] MSP/PSP initialization completed");
 
     // Initialize GPIO system
-    rprintln!("[MAIN] Starting GPIO initialization...");
     unsafe {
         init_gpio();
         rprintln!("[MAIN] GPIO initialization completed");
-
-        // LED ON = GPIO initialized (Step 1)
-        gpio_write(true);
-        for _ in 0..250000 { cortex_m::asm::nop(); }
-        rprintln!("[MAIN] LED ON - GPIO ready");
-
-        // LED OFF = Starting process manager (Step 2)
-        gpio_write(false);
-        for _ in 0..250000 { cortex_m::asm::nop(); }
-        rprintln!("[MAIN] LED OFF - Starting ProcessManager");
+        gpio_write(true); // LED ON to show GPIO ready
     }
 
-    // Initialize process manager and create processes
-    rprintln!("[MAIN] Creating ProcessManager...");
-    let process_mgr = process_manager();
-    rprintln!("[MAIN] ProcessManager created successfully");
-
-    // LED ON = Process manager ready (Step 3)
-    gpio_write(true);
-    for _ in 0..250000 { cortex_m::asm::nop(); }
-    rprintln!("[MAIN] LED ON - ProcessManager ready");
-
-    // Memory usage analysis
-    let mgr_addr = process_mgr as *const _ as u32;
-    let mgr_size = core::mem::size_of::<ProcessManager>();
-    rprintln!("[MEM] ProcessManager at 0x{:08X}, size: {} bytes", mgr_addr, mgr_size);
-    rprintln!("[MEM] Total task stack memory: {} bytes", MAX_TASKS * TASK_STACK_SIZE_WORDS * 4);
-    rprintln!("[MEM] SRAM usage: {}/{} bytes", mgr_addr - SRAM_START + mgr_size as u32, SRAM_SIZE);
-
-    rprintln!("[MAIN] Starting process creation...");
+    // Initialize the FreeRTOS-style scheduler
+    rprintln!("[SCHEDULER] Initializing task lists...");
     unsafe {
-        // Create processes with LED indicators
-
-        // LED OFF = Starting process 0 creation (Step 4)
-        gpio_write(false);
-        for _ in 0..250000 { cortex_m::asm::nop(); }
-        rprintln!("[MAIN] LED OFF - Creating Process 0");
-
-        let _pid0 = process_mgr.create_process(task0_entry as usize)
-            .expect("Failed to create task 0");
-        rprintln!("[MAIN] Process 0 created successfully");
-
-        // LED ON = Process 0 created (Step 5)
-        gpio_write(true);
-        for _ in 0..250000 { cortex_m::asm::nop(); }
-        rprintln!("[MAIN] LED ON - Process 0 ready");
-
-        // LED OFF = Starting process 1 creation (Step 6)
-        gpio_write(false);
-        for _ in 0..250000 { cortex_m::asm::nop(); }
-        rprintln!("[MAIN] LED OFF - Creating Process 1");
-
-        process_mgr.create_process(task1_entry as usize)
-            .expect("Failed to create task 1");
-        rprintln!("[MAIN] Process 1 created successfully");
-
-        // LED ON = Process 1 created (Step 7)
-        gpio_write(true);
-        for _ in 0..250000 { cortex_m::asm::nop(); }
-        rprintln!("[MAIN] LED ON - Process 1 ready");
-
-        // LED OFF = Starting process 2 creation (Step 8)
-        gpio_write(false);
-        for _ in 0..250000 { cortex_m::asm::nop(); }
-        rprintln!("[MAIN] LED OFF - Creating Process 2");
-
-        process_mgr.create_process(task2_entry as usize)
-            .expect("Failed to create task 2");
-        rprintln!("[MAIN] Process 2 created successfully");
-
-        // LED ON = All processes created (Step 9)
-        gpio_write(true);
-        for _ in 0..250000 { cortex_m::asm::nop(); }
-        rprintln!("[MAIN] LED ON - All processes created");
+        prv_initialise_task_lists();
     }
+    rprintln!("[SCHEDULER] Task lists initialized");
 
-    rprintln!("[MAIN] All {} processes created successfully!", MAX_TASKS);
+    // Create tasks using FreeRTOS-style API
+    rprintln!("[TASKS] Creating application tasks...");
 
-    // Initialize pure preemptive scheduler
-    rprintln!("[MAIN] Starting preemptive scheduler initialization...");
+    // Create Task 0 - LED control task (High Priority)
+    let mut task0_handle: TaskHandle_t = core::ptr::null_mut();
+    let result0 = unsafe {
+        x_task_create(
+            task0_entry,
+            "Task0",
+            configMINIMAL_STACK_SIZE as u16,
+            core::ptr::null_mut(),
+            2, // High priority
+            &mut task0_handle,
+        )
+    };
+    if result0 != pdPASS {
+        panic!("[ERROR] Failed to create Task 0");
+    }
+    rprintln!("[TASKS] Task 0 created successfully");
+
+    // Create Task 1 - General task (Medium Priority)
+    let mut task1_handle: TaskHandle_t = core::ptr::null_mut();
+    let result1 = unsafe {
+        x_task_create(
+            task1_entry,
+            "Task1",
+            configMINIMAL_STACK_SIZE as u16,
+            core::ptr::null_mut(),
+            1, // Medium priority
+            &mut task1_handle,
+        )
+    };
+    if result1 != pdPASS {
+        panic!("[ERROR] Failed to create Task 1");
+    }
+    rprintln!("[TASKS] Task 1 created successfully");
+
+    // Create Task 2 - Background task (Low Priority)
+    let mut task2_handle: TaskHandle_t = core::ptr::null_mut();
+    let result2 = unsafe {
+        x_task_create(
+            task2_entry,
+            "Task2",
+            configMINIMAL_STACK_SIZE as u16,
+            core::ptr::null_mut(),
+            0, // Low priority
+            &mut task2_handle,
+        )
+    };
+    if result2 != pdPASS {
+        panic!("[ERROR] Failed to create Task 2");
+    }
+    rprintln!("[TASKS] Task 2 created successfully");
+
+    rprintln!("[SCHEDULER] All application tasks created");
+
+    rprintln!("[SCHEDULER] Starting FreeRTOS scheduler...");
+
+    // Start the scheduler - this should never return
     unsafe {
-        // LED OFF = Starting scheduler initialization (Step 10)
-        gpio_write(false);
-        for _ in 0..250000 { cortex_m::asm::nop(); }
-        rprintln!("[MAIN] LED OFF - Starting scheduler");
-
-        rprintln!("[PREEMPTIVE] Starting pure preemptive multitasking");
-
-        // Set first task as current and running BEFORE enabling SysTick
-        rprintln!("[PREEMPTIVE] Setting up first task state...");
-        process_mgr.os_state.current_task = 0;
-        process_mgr.processes[0].state = ProcessState::Running;
-        rprintln!("[PREEMPTIVE] Task 0 set as initial running task");
-
-        // LED ON = First task ready (Step 11)
-        gpio_write(true);
-        for _ in 0..250000 { cortex_m::asm::nop(); }
-        rprintln!("[MAIN] LED ON - First task ready");
-
-        // Initialize SysTick AFTER first task setup (but don't enable yet)
-        rprintln!("[CORTEX-M] Preparing SysTick (not enabled yet)");
-        // Note: We'll enable SysTick after first task starts
-
-        // LED OFF = Preparing PSP (Step 12)
-        gpio_write(false);
-        for _ in 0..250000 { cortex_m::asm::nop(); }
-        rprintln!("[MAIN] LED OFF - Setting PSP");
-
-        // Set PSP to first task's stack pointer for direct jump
-        let initial_psp = process_mgr.processes[0].stack_pointer;
-        rprintln!("[PREEMPTIVE] First task PSP (hardware context): 0x{:08X}", initial_psp);
-
-        // Validate PSP range
-        if initial_psp < SRAM_START || initial_psp >= SRAM_END {
-            rprintln!("[ERROR] PSP 0x{:08X} out of SRAM bounds!", initial_psp);
-        } else {
-            rprintln!("[PREEMPTIVE] PSP validation: OK");
-        }
-
-        // Detailed stack frame verification
-        rprintln!("[STACK_VERIFY] Analyzing task 0 stack frame...");
-        let stack_base_ptr = initial_psp as *const u32;
-        let r0 = core::ptr::read_volatile(stack_base_ptr.offset(0));
-        let r1 = core::ptr::read_volatile(stack_base_ptr.offset(1));
-        let r2 = core::ptr::read_volatile(stack_base_ptr.offset(2));
-        let r3 = core::ptr::read_volatile(stack_base_ptr.offset(3));
-        let r12 = core::ptr::read_volatile(stack_base_ptr.offset(4));
-        let lr = core::ptr::read_volatile(stack_base_ptr.offset(5));
-        let pc = core::ptr::read_volatile(stack_base_ptr.offset(6));
-        let xpsr = core::ptr::read_volatile(stack_base_ptr.offset(7));
-
-        rprintln!("[HW_CONTEXT] R0=0x{:08X}, R1=0x{:08X}, R2=0x{:08X}, R3=0x{:08X}", r0, r1, r2, r3);
-        rprintln!("[HW_CONTEXT] R12=0x{:08X}, LR=0x{:08X}", r12, lr);
-        rprintln!("[HW_CONTEXT] PC=0x{:08X}, xPSR=0x{:08X}", pc, xpsr);
-
-        // Verify PC has Thumb bit set and points to valid task
-        if (pc & 1) == 0 {
-            rprintln!("[ERROR] PC 0x{:08X} missing Thumb bit!", pc);
-        } else {
-            rprintln!("[VERIFY] PC Thumb bit check: OK");
-        }
-
-        // Verify xPSR has Thumb state bit
-        if (xpsr & 0x01000000) == 0 {
-            rprintln!("[ERROR] xPSR 0x{:08X} missing Thumb state!", xpsr);
-        } else {
-            rprintln!("[VERIFY] xPSR Thumb state check: OK");
-        }
-
-        // Set PSP register
-        rprintln!("[PREEMPTIVE] Setting PSP register...");
-        core::arch::asm!(
-            "msr psp, {}",
-            in(reg) initial_psp
-        );
-
-        // Verify PSP was set correctly
-        let current_psp: u32;
-        core::arch::asm!(
-            "mrs {}, psp",
-            out(reg) current_psp
-        );
-        rprintln!("[PREEMPTIVE] PSP set and verified: 0x{:08X}", current_psp);
-
-        // Verify PSP matches what we set
-        if current_psp != initial_psp {
-            rprintln!("[ERROR] PSP mismatch! Set: 0x{:08X}, Read: 0x{:08X}", initial_psp, current_psp);
-        } else {
-            rprintln!("[VERIFY] PSP register check: OK");
-        }
-
-        // Read and log current CPU state before Thread mode switch
-        let current_msp: u32;
-        let current_control: u32;
-        let current_primask: u32;
-        core::arch::asm!(
-            "mrs {}, msp",
-            out(reg) current_msp
-        );
-        core::arch::asm!(
-            "mrs {}, control",
-            out(reg) current_control
-        );
-        core::arch::asm!(
-            "mrs {}, primask",
-            out(reg) current_primask
-        );
-
-        rprintln!("[CPU_STATE] Before Thread switch:");
-        rprintln!("[CPU_STATE] MSP=0x{:08X}, PSP=0x{:08X}", current_msp, current_psp);
-        rprintln!("[CPU_STATE] CONTROL=0x{:08X} (SPSEL={}, nPRIV={})",
-                 current_control, (current_control >> 1) & 1, current_control & 1);
-        rprintln!("[CPU_STATE] PRIMASK=0x{:08X} (interrupts {})",
-                 current_primask, if current_primask & 1 != 0 { "disabled" } else { "enabled" });
-
-        // LED ON = PSP ready (Step 13)
-        gpio_write(true);
-        for _ in 0..250000 { cortex_m::asm::nop(); }
-        rprintln!("[MAIN] LED ON - PSP configured");
-
-        // Final preparation before Thread mode switch
-        rprintln!("[PREEMPTIVE] About to switch to Thread mode...");
-        rprintln!("[PREEMPTIVE] EXC_RETURN will be: 0xFFFFFFFD (Thread+PSP)");
-
-        // LED OFF = About to switch to Thread mode (Step 14)
-        gpio_write(false);
-        for _ in 0..250000 { cortex_m::asm::nop(); }
-        rprintln!("[MAIN] LED OFF - Switching to Thread mode NOW!");
-
-        // Start first task through PendSV first_task_switch
-        rprintln!("[PREEMPTIVE] Starting first task via PendSV first_task_switch");
-
-        // Keep PSP at 0 so PendSV will use first_task_switch path
-        // PendSV will set up the proper PSP and switch to first task
-
-        // Enable interrupts and trigger PendSV to start first task
-        rprintln!("[PREEMPTIVE] Triggering PendSV for first task startup");
-        trigger_pendsv();
-
-        // Wait for PendSV to start the first task
-        rprintln!("[PREEMPTIVE] Waiting for first task to start...");
-
-        // Force interrupt enable and check status
-        core::arch::asm!("cpsie i"); // Clear PRIMASK - enable interrupts
-        core::arch::asm!("msr basepri, {}", in(reg) 0u32); // Clear BASEPRI - allow all priorities
-
-        // Read interrupt status registers
-        let primask: u32;
-        let basepri: u32;
-        let _shpr3: u32;
-
-        core::arch::asm!("mrs {}, primask", out(reg) primask);
-        core::arch::asm!("mrs {}, basepri", out(reg) basepri);
-        let shpr3 = read_volatile(0xE000ED20u32 as *const u32); // SHPR3
-
-        rprintln!("[INT_STATUS] PRIMASK: 0x{:02X} ({})", primask,
-                 if primask & 1 != 0 { "DISABLED" } else { "ENABLED" });
-        rprintln!("[INT_STATUS] BASEPRI: 0x{:02X}", basepri);
-        rprintln!("[INT_STATUS] SHPR3: 0x{:08X}", shpr3);
-        rprintln!("[INT_STATUS] PendSV priority: {}", (shpr3 >> 16) & 0xFF);
-        rprintln!("[INT_STATUS] SysTick priority: {}", (shpr3 >> 24) & 0xFF);
-        
-
-        // Busy wait instead of WFI to ensure PendSV can execute
-        let mut counter = 0u32;
-        loop {
-            cortex_m::asm::nop();
-            counter += 1;
-            if counter % 100000 == 0 {
-                rprintln!("[WAIT] Waiting for PendSV... counter: {}", counter);
-            }
-        }
+        v_task_start_scheduler();
     }
+
+    // Should never reach here if scheduler starts successfully
+    panic!("[ERROR] Scheduler failed to start!");
 }
 
 /// Hard Fault Handler for debugging
