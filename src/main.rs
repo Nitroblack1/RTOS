@@ -10,7 +10,20 @@
 #![allow(non_upper_case_globals)]
 
 use cortex_m_rt::entry;
-use panic_halt as _;
+use core::panic::PanicInfo;
+// use panic_halt as _;
+
+#[panic_handler]
+fn panic_handler(info: &PanicInfo) -> ! {
+    rprintln!("[PANIC] Panic occurred!");
+    if let Some(location) = info.location() {
+        rprintln!("[PANIC] Location: {}:{}:{}", location.file(), location.line(), location.column());
+    }
+    rprintln!("[PANIC] Message: {}", info.message());
+    loop {
+        cortex_m::asm::wfi();
+    }
+}
 use rtt_target::{rprintln, rtt_init_print};
 use core::arch::global_asm;
 use core::ptr::{read_volatile, write_volatile};
@@ -27,13 +40,13 @@ pub const configUSE_PREEMPTION: u32 = 1;
 pub const configUSE_TASK_NOTIFICATIONS: u32 = 1;
 pub const configUSE_16_BIT_TICKS: u32 = 0;
 pub const configMAX_PRIORITIES: usize = 5;
-pub const configMINIMAL_STACK_SIZE: usize = 64; // Stack size in words
+pub const configMINIMAL_STACK_SIZE: usize = 256; // Stack size in words (increased for debugging)
 pub const configMAX_TASK_NAME_LEN: usize = 16;
 pub const configUSE_TRACE_FACILITY: u32 = 1;
 pub const configCHECK_FOR_STACK_OVERFLOW: u32 = 2;
 
 /// Maximum number of tasks (application specific)
-pub const MAX_TASKS: usize = 3;
+pub const MAX_TASKS: usize = 4; // 3 application tasks + 1 idle task
 
 /// Interrupt priorities (following ARM Cortex-M4 conventions)
 pub const configKERNEL_INTERRUPT_PRIORITY: u8 = 255;        // Lowest priority
@@ -1606,8 +1619,7 @@ pub unsafe fn x_task_create(
             return_value = pdPASS;
             UX_CURRENT_NUMBER_OF_TASKS += 1;
 
-            rprintln!("[TASK] Created task '{}' priority {} stack {:?}",
-                      task_name, priority, (*p_new_tcb).p_top_of_stack);
+            // Task created
         } else {
             rprintln!("[ERROR] Maximum number of tasks reached");
         }
@@ -1666,13 +1678,13 @@ unsafe fn prv_add_new_task_to_ready_list(p_new_tcb: *mut tskTCB) {
             // Add the task to the ready list for its priority
             v_list_insert_end(&raw mut PX_READY_TASK_LISTS[priority as usize], &raw mut (*p_new_tcb).generic_list_item);
 
-            rprintln!("[SCHEDULER] Added task to ready list priority {}", priority);
+            // Added to ready list
 
             // If this is the first task or the scheduler is not running yet,
             // and this task has higher priority than current, make it current
             if UX_CURRENT_NUMBER_OF_TASKS == 1 || PX_CURRENT_TCB.is_null() {
                 PX_CURRENT_TCB = p_new_tcb;
-                rprintln!("[SCHEDULER] Set as current task");
+                // Set as current task
             }
         }
         port_exit_critical();
@@ -1722,7 +1734,7 @@ unsafe fn prv_initialise_task_lists() {
         PX_DELAYED_TASK_LIST = &raw mut X_DELAYED_TASK_LIST1;
         PX_OVERFLOW_DELAYED_TASK_LIST = &raw mut X_DELAYED_TASK_LIST2;
 
-        rprintln!("[SCHEDULER] Task lists initialized");
+        // Task lists ready
     }
 }
 
@@ -1787,9 +1799,28 @@ unsafe fn px_port_start_scheduler() -> BaseType_t {
 
         // Start first task by triggering PendSV
         if !PX_CURRENT_TCB.is_null() {
+            let current_ptr = PX_CURRENT_TCB as *const tskTCB;
+            rprintln!("[SCHEDULER] Starting first task: {:p}", current_ptr);
+
+            // Debug interrupt state before yielding
+            let primask: u32;
+            let basepri: u32;
+            unsafe {
+                core::arch::asm!("mrs {}, primask", out(reg) primask);
+                core::arch::asm!("mrs {}, basepri", out(reg) basepri);
+            }
+            rprintln!("[DEBUG] PRIMASK: 0x{:02X}, BASEPRI: 0x{:02X}", primask, basepri);
+
             port_yield();
-            pdTRUE
+            rprintln!("[ERROR] px_port_start_scheduler returned unexpectedly!");
+
+            // This should never return in a real FreeRTOS system
+            loop {
+                rprintln!("[ERROR] Scheduler failed to start tasks!");
+                cortex_m::asm::wfi();
+            }
         } else {
+            rprintln!("[ERROR] No current TCB set!");
             pdFAIL
         }
     }
@@ -1819,7 +1850,12 @@ unsafe fn prv_setup_timer_interrupt() {
 /// Task 0: LED control task (FreeRTOS-style)
 #[unsafe(no_mangle)]
 pub extern "C" fn task0_entry(_parameters: *mut c_void) -> ! {
-    rprintln!("[TASK0] Starting FreeRTOS LED control task - Priority 2");
+    // Try LED toggle first - if task starts, LED should change pattern
+    gpio_toggle();
+    gpio_toggle();
+    gpio_toggle(); // Triple toggle to signal task start
+
+    rprintln!("[TASK0] *** TASK0 STARTED *** Starting FreeRTOS LED control task - Priority 2");
 
     let mut counter = 0u32;
 
@@ -1951,10 +1987,10 @@ fn main() -> ! {
     unsafe {
         prv_initialise_task_lists();
     }
-    rprintln!("[SCHEDULER] Task lists initialized");
+    // Task lists ready
 
     // Create tasks using FreeRTOS-style API
-    rprintln!("[TASKS] Creating application tasks...");
+    rprintln!("[MAIN] Creating tasks...");
 
     // Create Task 0 - LED control task (High Priority)
     let mut task0_handle: TaskHandle_t = core::ptr::null_mut();
@@ -1971,7 +2007,7 @@ fn main() -> ! {
     if result0 != pdPASS {
         panic!("[ERROR] Failed to create Task 0");
     }
-    rprintln!("[TASKS] Task 0 created successfully");
+    // Task 0 OK
 
     // Create Task 1 - General task (Medium Priority)
     let mut task1_handle: TaskHandle_t = core::ptr::null_mut();
@@ -1988,7 +2024,7 @@ fn main() -> ! {
     if result1 != pdPASS {
         panic!("[ERROR] Failed to create Task 1");
     }
-    rprintln!("[TASKS] Task 1 created successfully");
+    // Task 1 OK
 
     // Create Task 2 - Background task (Low Priority)
     let mut task2_handle: TaskHandle_t = core::ptr::null_mut();
@@ -2005,8 +2041,7 @@ fn main() -> ! {
     if result2 != pdPASS {
         panic!("[ERROR] Failed to create Task 2");
     }
-    rprintln!("[TASKS] Task 2 created successfully");
-
+    rprintln!("[MAIN] All tasks created");
     rprintln!("[SCHEDULER] All application tasks created");
 
     rprintln!("[SCHEDULER] Starting FreeRTOS scheduler...");
