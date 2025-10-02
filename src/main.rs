@@ -784,7 +784,7 @@ pub unsafe fn initialize_msp_psp_separation() {
     unsafe {
         rprintln!("[MSP/PSP] Initializing stack separation");
 
-        // Read current MSP (set by bootloader - don't change it!)
+        // Read current MSP
         let current_msp: u32;
         core::arch::asm!(
             "mrs {}, msp",
@@ -846,15 +846,12 @@ unsafe fn initialize_systick() {
 /// Trigger PendSV for context switching
 pub fn trigger_pendsv() {
     rprintln!("[PENDSV] Triggering PendSV interrupt...");
-    unsafe {
-        // Set PendSV bit in NVIC ICSR register
-        write_volatile(NVIC_ICSR as *mut u32, 1 << 28);
 
-        // Read back to verify
-        let icsr = read_volatile(NVIC_ICSR as *const u32);
-        rprintln!("[PENDSV] ICSR register after trigger: 0x{:08X}", icsr);
-        rprintln!("[PENDSV] PendSV pending bit: {}", (icsr >> 28) & 1);
-    }
+    // Use cortex-m SCB to trigger PendSV safely
+    rprintln!("[PENDSV] Setting PendSV using SCB::set_pendsv()");
+    cortex_m::peripheral::SCB::set_pendsv();
+    rprintln!("[PENDSV] SCB::set_pendsv() completed");
+
     rprintln!("[PENDSV] PendSV trigger completed, waiting for interrupt...");
 }
 
@@ -961,16 +958,24 @@ pub extern "C" fn pendsv_switch_handler(old_psp: u32) -> u32 {
 
 global_asm!(
     r#"
-    .global PendSV_Handler
-    .type PendSV_Handler, %function
+    .global PendSV
+    .type   PendSV, %function
+    .thumb
+    .thumb_func
 PendSV_Handler:
-    /* Cortex-M PendSV Handler (FreeRTOS-style, no FPU) */
+    /* Cortex-M PendSV_Handler (FreeRTOS-style, no FPU) */
+
+    /* LED ON to indicate PendSV entry */
+    ldr     r1, =0x40020018     /* GPIOA_BSRR */
+    mov     r2, #32             /* Set bit 5 (LED ON) */
+    str     r2, [r1]            /* GIOPA_BSRR 레지스터에 LED_ON 값을 넣어주는 역할 */
 
     /* Save current PSP into r0 */
     mrs     r0, psp
 
     /* Check first switch (PSP == 0) */
-    cbz     r0, first_task_switch
+    /* Compare and Branch on Zero : r0 == 0이면 first_task 레이블로 분기. 첫 태스크 실행 전 PSP가 0일 때 사용. */
+    cbz     r0, first_task_switch   
 
     /* NORMAL TASK SWITCH */
 normal_task_switch:
@@ -978,7 +983,7 @@ normal_task_switch:
     stmdb   r0!, {{r4-r11, r14}}
 
     /* Call Rust handler */
-    bl      {0}
+    bl      {0}     /* cur PC +  4를 LR에 저장 -> 함수 호출처럼 동작 */
 
     /* Restore callee-saved registers + LR */
     ldmia   r0!, {{r4-r11, r14}}
@@ -1018,6 +1023,13 @@ first_task_switch:
 #[unsafe(no_mangle)]
 pub extern "C" fn task0_entry() -> ! {
     rprintln!("[TASK0] Starting pure preemptive LED control task");
+
+    // Enable SysTick now that first task has started
+    rprintln!("[TASK0] Enabling SysTick for preemptive scheduling");
+    unsafe {
+        initialize_systick();
+    }
+    rprintln!("[TASK0] SysTick enabled - preemptive multitasking active");
 
     let mut counter = 0u32;
 
@@ -1145,12 +1157,12 @@ fn main() -> ! {
 
         // LED ON = GPIO initialized (Step 1)
         gpio_write(true);
-        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        for _ in 0..250000 { cortex_m::asm::nop(); }
         rprintln!("[MAIN] LED ON - GPIO ready");
 
         // LED OFF = Starting process manager (Step 2)
         gpio_write(false);
-        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        for _ in 0..250000 { cortex_m::asm::nop(); }
         rprintln!("[MAIN] LED OFF - Starting ProcessManager");
     }
 
@@ -1161,7 +1173,7 @@ fn main() -> ! {
 
     // LED ON = Process manager ready (Step 3)
     gpio_write(true);
-    for _ in 0..2000000 { cortex_m::asm::nop(); }
+    for _ in 0..250000 { cortex_m::asm::nop(); }
     rprintln!("[MAIN] LED ON - ProcessManager ready");
 
     // Memory usage analysis
@@ -1177,7 +1189,7 @@ fn main() -> ! {
 
         // LED OFF = Starting process 0 creation (Step 4)
         gpio_write(false);
-        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        for _ in 0..250000 { cortex_m::asm::nop(); }
         rprintln!("[MAIN] LED OFF - Creating Process 0");
 
         let _pid0 = process_mgr.create_process(task0_entry as usize)
@@ -1186,12 +1198,12 @@ fn main() -> ! {
 
         // LED ON = Process 0 created (Step 5)
         gpio_write(true);
-        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        for _ in 0..250000 { cortex_m::asm::nop(); }
         rprintln!("[MAIN] LED ON - Process 0 ready");
 
         // LED OFF = Starting process 1 creation (Step 6)
         gpio_write(false);
-        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        for _ in 0..250000 { cortex_m::asm::nop(); }
         rprintln!("[MAIN] LED OFF - Creating Process 1");
 
         process_mgr.create_process(task1_entry as usize)
@@ -1200,12 +1212,12 @@ fn main() -> ! {
 
         // LED ON = Process 1 created (Step 7)
         gpio_write(true);
-        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        for _ in 0..250000 { cortex_m::asm::nop(); }
         rprintln!("[MAIN] LED ON - Process 1 ready");
 
         // LED OFF = Starting process 2 creation (Step 8)
         gpio_write(false);
-        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        for _ in 0..250000 { cortex_m::asm::nop(); }
         rprintln!("[MAIN] LED OFF - Creating Process 2");
 
         process_mgr.create_process(task2_entry as usize)
@@ -1214,7 +1226,7 @@ fn main() -> ! {
 
         // LED ON = All processes created (Step 9)
         gpio_write(true);
-        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        for _ in 0..250000 { cortex_m::asm::nop(); }
         rprintln!("[MAIN] LED ON - All processes created");
     }
 
@@ -1225,29 +1237,29 @@ fn main() -> ! {
     unsafe {
         // LED OFF = Starting scheduler initialization (Step 10)
         gpio_write(false);
-        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        for _ in 0..250000 { cortex_m::asm::nop(); }
         rprintln!("[MAIN] LED OFF - Starting scheduler");
 
         rprintln!("[PREEMPTIVE] Starting pure preemptive multitasking");
 
-        // Initialize SysTick for preemptive scheduling
-        initialize_systick();
-        rprintln!("[PREEMPTIVE] SysTick initialized for 10ms time slices");
-
-        // LED ON = SysTick initialized (Step 11)
-        gpio_write(true);
-        for _ in 0..2000000 { cortex_m::asm::nop(); }
-        rprintln!("[MAIN] LED ON - SysTick ready");
-
-        // Set first task as current and running
+        // Set first task as current and running BEFORE enabling SysTick
         rprintln!("[PREEMPTIVE] Setting up first task state...");
         process_mgr.os_state.current_task = 0;
         process_mgr.processes[0].state = ProcessState::Running;
         rprintln!("[PREEMPTIVE] Task 0 set as initial running task");
 
+        // LED ON = First task ready (Step 11)
+        gpio_write(true);
+        for _ in 0..250000 { cortex_m::asm::nop(); }
+        rprintln!("[MAIN] LED ON - First task ready");
+
+        // Initialize SysTick AFTER first task setup (but don't enable yet)
+        rprintln!("[CORTEX-M] Preparing SysTick (not enabled yet)");
+        // Note: We'll enable SysTick after first task starts
+
         // LED OFF = Preparing PSP (Step 12)
         gpio_write(false);
-        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        for _ in 0..250000 { cortex_m::asm::nop(); }
         rprintln!("[MAIN] LED OFF - Setting PSP");
 
         // Set PSP to first task's stack pointer for direct jump
@@ -1339,7 +1351,7 @@ fn main() -> ! {
 
         // LED ON = PSP ready (Step 13)
         gpio_write(true);
-        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        for _ in 0..250000 { cortex_m::asm::nop(); }
         rprintln!("[MAIN] LED ON - PSP configured");
 
         // Final preparation before Thread mode switch
@@ -1348,46 +1360,52 @@ fn main() -> ! {
 
         // LED OFF = About to switch to Thread mode (Step 14)
         gpio_write(false);
-        for _ in 0..2000000 { cortex_m::asm::nop(); }
+        for _ in 0..250000 { cortex_m::asm::nop(); }
         rprintln!("[MAIN] LED OFF - Switching to Thread mode NOW!");
 
-        // This is the critical moment - switch to Thread mode
-        // For first task startup, we need to:
-        // 1. Set PSP to top of stack (above hardware context)
-        // 2. Switch to Thread mode with PSP using CONTROL register
-        // 3. Jump directly to task entry point
+        // Start first task through PendSV first_task_switch
+        rprintln!("[PREEMPTIVE] Starting first task via PendSV first_task_switch");
 
-        rprintln!("[PREEMPTIVE] Starting first task with direct Thread mode switch");
+        // Keep PSP at 0 so PendSV will use first_task_switch path
+        // PendSV will set up the proper PSP and switch to first task
 
-        // Get stack top (above the pre-built context) for first task
-        // The initial_psp points to hardware context, but for startup we need stack top
-        let stack_top = process_mgr.processes[0].stack_pointer + (HW_CONTEXT_SIZE as u32 * 4);
-        rprintln!("[PREEMPTIVE] Setting PSP to stack top: 0x{:08X}", stack_top);
+        // Enable interrupts and trigger PendSV to start first task
+        rprintln!("[PREEMPTIVE] Triggering PendSV for first task startup");
+        trigger_pendsv();
 
-        // Set PSP register to stack top
-        core::arch::asm!(
-            "msr psp, {}",
-            in(reg) stack_top
-        );
+        // Wait for PendSV to start the first task
+        rprintln!("[PREEMPTIVE] Waiting for first task to start...");
 
-        // Switch to Thread mode using PSP via CONTROL register
-        core::arch::asm!(
-            "mrs r0, control",      // Read current CONTROL register
-            "orr r0, r0, #0x02",    // Set SPSEL bit (use PSP instead of MSP)
-            "msr control, r0",      // Update CONTROL register
-            "isb",                  // Instruction Synchronization Barrier
-            out("r0") _,
-        );
+        // Force interrupt enable and check status
+        core::arch::asm!("cpsie i"); // Clear PRIMASK - enable interrupts
+        core::arch::asm!("msr basepri, {}", in(reg) 0u32); // Clear BASEPRI - allow all priorities
 
-        // Jump directly to first task entry point in Thread mode
-        let task_entry = task0_entry as u32;
-        rprintln!("[PREEMPTIVE] Jumping to task0_entry: 0x{:08X}", task_entry);
+        // Read interrupt status registers
+        let primask: u32;
+        let basepri: u32;
+        let _shpr3: u32;
 
-        core::arch::asm!(
-            "bx {}",
-            in(reg) task_entry,
-            options(noreturn)
-        );
+        core::arch::asm!("mrs {}, primask", out(reg) primask);
+        core::arch::asm!("mrs {}, basepri", out(reg) basepri);
+        let shpr3 = read_volatile(0xE000ED20u32 as *const u32); // SHPR3
+
+        rprintln!("[INT_STATUS] PRIMASK: 0x{:02X} ({})", primask,
+                 if primask & 1 != 0 { "DISABLED" } else { "ENABLED" });
+        rprintln!("[INT_STATUS] BASEPRI: 0x{:02X}", basepri);
+        rprintln!("[INT_STATUS] SHPR3: 0x{:08X}", shpr3);
+        rprintln!("[INT_STATUS] PendSV priority: {}", (shpr3 >> 16) & 0xFF);
+        rprintln!("[INT_STATUS] SysTick priority: {}", (shpr3 >> 24) & 0xFF);
+        
+
+        // Busy wait instead of WFI to ensure PendSV can execute
+        let mut counter = 0u32;
+        loop {
+            cortex_m::asm::nop();
+            counter += 1;
+            if counter % 100000 == 0 {
+                rprintln!("[WAIT] Waiting for PendSV... counter: {}", counter);
+            }
+        }
     }
 }
 
