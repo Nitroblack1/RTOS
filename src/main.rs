@@ -6,7 +6,7 @@
 use cortex_m_rt::entry;
 use panic_halt as _;
 use rtt_target::{rprintln, rtt_init_print};
-use stm32f4; // Required for interrupt vectors
+use stm32f4 as _; // Required for memory layout and vector table
 
 const CYCLES_PER_MS_ESTIMATE: u32 = 16_000;
 
