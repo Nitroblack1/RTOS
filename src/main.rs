@@ -8,6 +8,25 @@ use panic_halt as _;
 use rtt_target::{rprintln, rtt_init_print};
 use stm32f4 as _; // Required for memory layout and vector table
 
+
+#[cortex_m_rt::exception]
+unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
+    rprintln!("[FATAL] HardFault occurred at PC: 0x{:08x}", ef.pc());
+    loop {}
+}
+
+#[cortex_m_rt::exception]
+unsafe fn UsageFault() -> ! {
+    rprintln!("[FATAL] UsageFault occurred");
+    loop {}
+}
+
+#[cortex_m_rt::exception]
+unsafe fn MemoryManagement() -> ! {
+    rprintln!("[FATAL] MemoryManagement fault occurred");
+    loop {}
+}
+
 const CYCLES_PER_MS_ESTIMATE: u32 = 16_000;
 
 #[derive(Copy, Clone, Debug)]
@@ -35,7 +54,6 @@ mod board {
     use core::ptr::{read_volatile, write_volatile};
     use crate::{GpioPin, Syscalls};
     use cortex_m::asm::nop;
-    use rtt_target::{rprintln};
 
     const RCC_BASE: u32 = 0x4002_3800;
     const RCC_AHB1ENR: *mut u32 = (RCC_BASE + 0x30) as *mut u32;
@@ -105,7 +123,6 @@ mod board {
     }
 
     unsafe fn gpio_write(port_base: u32, pin: u8, high: bool) {
-        rprintln!("[GPIO] gpio_write called: pin={}, high={}", pin, high);
         let bsrr = reg32(port_base + BSRR_OFF);
         let val = if high { 1u32 << pin } else { 1u32 << (pin + 16) };
         unsafe { write_volatile(bsrr, val) };
@@ -249,8 +266,6 @@ mod svc {
     use core::arch::{asm, global_asm};
     use core::sync::atomic::{AtomicU32, Ordering};
 
-    use rtt_target::{rprintln};
-
     use crate::{GpioPin, Syscalls};
 
     pub mod abi {
@@ -316,7 +331,6 @@ mod svc {
     extern "C" fn svcall_rust(frame: &mut ExceptionFrame) {
         let call_id = (frame.r0 & 0xFF) as u8;
 
-        rprintln!("[SVC] svcall_rust called with ID: {}", call_id);
 
         SVC_COUNTER.fetch_add(1, Ordering::Relaxed);
         if call_id == abi::NOW_MS {
@@ -388,7 +402,6 @@ mod svc {
 
 mod sched {
     use cortex_m_rt::exception;
-    use core::arch::global_asm;
     use crate::{task0_entry, task1_entry, task2_entry};
     use rtt_target::rprintln;
 
@@ -418,170 +431,234 @@ mod sched {
     const ICSR: *mut u32 = 0xE000_ED04 as *mut u32;
     const SHPR3: *mut u32 = 0xE000_ED20 as *mut u32;
 
-    #[inline(always)]
-    fn build_initial_psp(stack: &mut [u32], entry: usize) -> u32 {
-        const SW: usize = 8;  // Software frame: r4-r11
-        const HW: usize = 8;  // Hardware frame: r0-r3, r12, lr, pc, xpsr
-        const GUARD: usize = 8; // Guard space
-
+    // Proper stack initialization with both software and hardware context
+    fn init_task_stack(stack: &mut [u32], task_fn: usize) -> u32 {
         let len = stack.len();
-        let base = len - (SW + HW + GUARD);
 
-        rprintln!("[STACK] Building stack for entry=0x{:08X}", entry);
-        rprintln!("[STACK] Stack layout: SW({}) + HW({}) + GUARD({}) = {} words", SW, HW, GUARD, SW + HW + GUARD);
-        rprintln!("[STACK] Stack length: {} words, base offset: {}", len, base);
-
-        // Clear and initialize software context (r4-r11) to zero
-        for i in 0..SW {
-            stack[base + i] = 0;
-        }
-        rprintln!("[STACK] SW context (R4-R11) cleared at offset {}-{}", base, base + SW - 1);
-
-        // Initialize hardware context
-        let hw = base + SW;
-        rprintln!("[STACK] HW context starts at offset {}", hw);
-
-        stack[hw + 0] = 0x11111111;  // R0 - distinctive value for debugging
-        stack[hw + 1] = 0x22222222;  // R1
-        stack[hw + 2] = 0x33333333;  // R2
-        stack[hw + 3] = 0x44444444;  // R3
-        stack[hw + 4] = 0x55555555;  // R12
-        stack[hw + 5] = (task_return_trap as u32) | 1;  // LR with Thumb bit
-        let pc_value = (entry as u32 & !1) | 1;  // PC with Thumb bit
-        stack[hw + 6] = pc_value;
-        stack[hw + 7] = 0x0100_0000;  // xPSR with Thumb state
-
-        // Debug the actual stack frame values
-        rprintln!("[STACK] HW frame initialized:");
-        rprintln!("[STACK]   R0={:08X} R1={:08X} R2={:08X} R3={:08X}", stack[hw+0], stack[hw+1], stack[hw+2], stack[hw+3]);
-        rprintln!("[STACK]   R12={:08X} LR={:08X} PC={:08X} xPSR={:08X}", stack[hw+4], stack[hw+5], stack[hw+6], stack[hw+7]);
-
-        // Calculate actual addresses
-        let psp = unsafe { stack.as_ptr().add(base) as u32 };  // Points to SW context start
-        let hw_context = unsafe { stack.as_ptr().add(hw) as u32 };  // Points to HW context start
-
-        rprintln!("[STACK] Memory layout:");
-        rprintln!("[STACK]   PSP (SW start) = 0x{:08X}", psp);
-        rprintln!("[STACK]   HW start      = 0x{:08X} (PSP + {})", hw_context, hw_context - psp);
-        rprintln!("[STACK]   Expected: PSP + 32 = 0x{:08X}", psp + 32);
-
-        if hw_context != psp + 32 {
-            rprintln!("[STACK] ERROR: HW context not at PSP+32!");
-        }
-
-        // Verify memory bounds
-        let stack_start = stack.as_ptr() as u32;
-        let stack_end = unsafe { stack.as_ptr().add(stack.len()) as u32 };
-        rprintln!("[STACK] Stack bounds: 0x{:08X} - 0x{:08X} (size={})", stack_start, stack_end, stack.len() * 4);
-
-        if psp < stack_start || psp >= stack_end {
-            rprintln!("[STACK] ERROR: PSP 0x{:08X} out of bounds!", psp);
-            loop {}
-        }
-        if hw_context < stack_start || hw_context >= stack_end {
-            rprintln!("[STACK] ERROR: HW context 0x{:08X} out of bounds!", hw_context);
+        // Validate task function address
+        if (task_fn as u32) < 0x08000000 || (task_fn as u32) >= 0x08100000 {
+            rprintln!("[FATAL] Invalid task function: 0x{:08x}", task_fn);
             loop {}
         }
 
-        // Verify alignment
-        if psp & 7 != 0 {
-            rprintln!("[STACK] ERROR: PSP 0x{:08X} not 8-byte aligned!", psp);
-            loop {}
-        }
+        // Stack layout: [control+lr] [software context (r2-r11)] [hardware context (r0-r3,r12,lr,pc,xpsr)]
+        // Total: 2 + 10 + 8 = 20 words from top
+        let sp = unsafe { stack.as_ptr().add(len - 20) as u32 };
 
-        rprintln!("[STACK] Stack initialization complete, returning PSP=0x{:08X}", psp);
-        psp
+        // Initialize CONTROL and EXC_RETURN values
+        let control_frame = unsafe { core::slice::from_raw_parts_mut(sp as *mut u32, 2) };
+        control_frame[0] = 0x02;        // CONTROL: Use PSP for thread mode
+        control_frame[1] = 0xFFFFFFFD;  // EXC_RETURN: Thread mode, PSP, no FPU
+
+        // Initialize software context (r2-r11) - extended from r4-r11 to include r2,r3
+        let sw_frame = unsafe { core::slice::from_raw_parts_mut((sp + 8) as *mut u32, 10) };
+        sw_frame[0] = 0x22222222;  // r2
+        sw_frame[1] = 0x33333333;  // r3
+        sw_frame[2] = 0x44444444;  // r4
+        sw_frame[3] = 0x55555555;  // r5
+        sw_frame[4] = 0x66666666;  // r6
+        sw_frame[5] = 0x77777777;  // r7
+        sw_frame[6] = 0x88888888;  // r8
+        sw_frame[7] = 0x99999999;  // r9
+        sw_frame[8] = 0xAAAAAAAA;  // r10
+        sw_frame[9] = 0xBBBBBBBB;  // r11
+
+        // Initialize hardware context (r0, r1, r12, lr, pc, xpsr) - reduced since r2,r3 moved to SW
+        let hw_frame = unsafe { core::slice::from_raw_parts_mut((sp + 48) as *mut u32, 8) };
+        hw_frame[0] = 0x00000000;  // r0
+        hw_frame[1] = 0x01010101;  // r1
+        hw_frame[2] = 0x02020202;  // r2 (will be overwritten by SW context)
+        hw_frame[3] = 0x03030303;  // r3 (will be overwritten by SW context)
+        hw_frame[4] = 0x12121212;  // r12
+        hw_frame[5] = 0xFFFFFFFE;  // LR (exception return value)
+        hw_frame[6] = task_fn as u32 | 1;  // PC with Thumb bit
+        hw_frame[7] = 0x01000000;  // xPSR with Thumb state
+
+        rprintln!("[STACK] Task SP: 0x{:08x}, PC: 0x{:08x}", sp, hw_frame[6]);
+
+        sp
     }
 
+    #[unsafe(no_mangle)]
     extern "C" fn task_return_trap() -> ! {
+        rprintln!("[FATAL] Task returned unexpectedly - this should never happen");
+
         loop {
-            unsafe { core::ptr::write_volatile(ICSR, 1 << 28); }
+            unsafe {
+                core::ptr::write_volatile(ICSR, 1 << 28);
+                // Memory barrier
+                core::arch::asm!("dsb", "isb", options(nomem, nostack));
+                // Wait a bit before retriggering
+                for _ in 0..1000 {
+                    core::arch::asm!("nop", options(nomem, nostack));
+                }
+            }
         }
     }
 
     pub unsafe fn init_kernel_and_tasks() {
         unsafe {
-            rprintln!("[INIT] Setting up kernel stack...");
 
             // Initialize kernel stack - MSP will continue to use this
-            let kernel_stack_ptr = core::ptr::addr_of_mut!(KERNEL_STACK.0);
-            let kernel_stack_base = (*kernel_stack_ptr).as_ptr() as u32;
-            let kernel_stack_top = kernel_stack_base + (KERNEL_STACK_WORDS * 4) as u32;
-            rprintln!("[INIT] Kernel stack: 0x{:08X} - 0x{:08X} (size={} bytes)",
-                     kernel_stack_base,
-                     kernel_stack_top,
-                     KERNEL_STACK_WORDS * 4);
+            let _kernel_stack_ptr = core::ptr::addr_of_mut!(KERNEL_STACK.0);
 
             // MSP should already be pointing to a valid kernel stack
             // We don't change MSP here - it stays as the kernel/interrupt stack
 
-            rprintln!("[INIT] Initializing {} tasks...", N_TASKS);
 
-            let p0 = build_initial_psp(&mut TASK_STACKS[0].0, task0_entry as usize);
-            let p1 = build_initial_psp(&mut TASK_STACKS[1].0, task1_entry as usize);
-            let p2 = build_initial_psp(&mut TASK_STACKS[2].0, task2_entry as usize);
-
+            // Initialize Task 0
+            let task0_addr = task0_entry as usize;
+            rprintln!("[SCHED] Task 0 entry point: 0x{:08x}", task0_addr);
+            let p0 = init_task_stack(&mut TASK_STACKS[0].0, task0_addr);
             TCBS[0].sp = p0;
+
+            // Memory barrier and small delay before next task
+            core::arch::asm!("dsb", "isb", options(nomem, nostack));
+            for _ in 0..1000 {
+                core::arch::asm!("nop", options(nomem, nostack));
+            }
+
+            // Initialize Task 1
+            let task1_addr = task1_entry as usize;
+            rprintln!("[SCHED] Task 1 entry point: 0x{:08x}", task1_addr);
+            let p1 = init_task_stack(&mut TASK_STACKS[1].0, task1_addr);
             TCBS[1].sp = p1;
+
+            // Initialize Task 2
+            let task2_addr = task2_entry as usize;
+            rprintln!("[SCHED] Task 2 entry point: 0x{:08x}", task2_addr);
+            let p2 = init_task_stack(&mut TASK_STACKS[2].0, task2_addr);
             TCBS[2].sp = p2;
+
             CURR = 0;
 
-            rprintln!("[INIT] Kernel and tasks ready");
-            rprintln!("[INIT] MSP (kernel): 0x{:08X}", cortex_m::register::msp::read() as u32);
-            rprintln!("[INIT] PSP (unused): 0x{:08X}", cortex_m::register::psp::read() as u32);
+            rprintln!("[SCHED] All tasks initialized");
         }
     }
 
-    pub unsafe fn init_systick_50us() {
-        let mut v = unsafe { core::ptr::read_volatile(SHPR3) };
-        v &= !0xFFFF_0000;
-        v |= (0x80u32 << 24) | (0xFFu32 << 16);
-        unsafe { core::ptr::write_volatile(SHPR3, v); }
+    pub unsafe fn init_systick_1s() {
+        unsafe {
+            // Initialize BASEPRI to 0 (no masking)
+            core::arch::asm!("mov r0, #0", "msr basepri, r0", out("r0") _, options(nomem, nostack));
 
-        let syst_csr = 0xE000_E010 as *mut u32;
-        let syst_rvr = 0xE000_E014 as *mut u32;
-        let syst_cvr = 0xE000_E018 as *mut u32;
+            // Set up SysTick registers
+            let syst_csr = 0xE000_E010 as *mut u32;
+            let syst_rvr = 0xE000_E014 as *mut u32;
+            let syst_cvr = 0xE000_E018 as *mut u32;
 
-        unsafe { core::ptr::write_volatile(syst_rvr, 799); }
-        unsafe { core::ptr::write_volatile(syst_cvr, 0); }
-        unsafe { core::ptr::write_volatile(syst_csr, (1 << 2) | (1 << 1) | 1); }
+            // Configure SysTick: 1 second intervals
+            core::ptr::write_volatile(syst_rvr, 15999999);  // 1s at 16MHz
+            core::ptr::write_volatile(syst_cvr, 0);          // Clear current value
+            core::ptr::write_volatile(syst_csr, (1 << 2) | 1);  // Enable counting but no interrupt initially
+
+            rprintln!("[SYSTICK] Configured for 1 second intervals");
+
+            // Memory barrier
+            core::arch::asm!("dsb", "isb", options(nomem, nostack));
+        }
+    }
+
+    pub unsafe fn enable_systick_interrupt() {
+        unsafe {
+            let syst_csr = 0xE000_E010 as *mut u32;
+            // Enable both counting and interrupt
+            core::ptr::write_volatile(syst_csr, (1 << 2) | (1 << 1) | 1);
+            // Memory barrier
+            core::arch::asm!("dsb", "isb", options(nomem, nostack));
+        }
     }
 
     pub fn start() -> ! {
-        rprintln!("[SCHED] Scheduler starting...");
-        rprintln!("[SCHED] Kernel runs in privileged mode on MSP");
-        rprintln!("[SCHED] Tasks will run in unprivileged mode on PSP");
+        rprintln!("[SCHED] Starting...");
 
         unsafe {
-            rprintln!("[SCHED] Current MSP (kernel stack): 0x{:08X}", cortex_m::register::msp::read() as u32);
-            rprintln!("[SCHED] Current PSP (task stack): 0x{:08X}", cortex_m::register::psp::read() as u32);
-            rprintln!("[SCHED] Current CONTROL: 0x{:08X}", cortex_m::register::control::read().bits());
-
-            rprintln!("[SCHED] Initializing SysTick for 50µs preemptive scheduling");
-            init_systick_50us();
-
-            rprintln!("[SCHED] Triggering first context switch to Task 0");
-            rprintln!("[SCHED] After this PendSV, kernel returns to WFI but tasks execute on PSP");
-
-            core::ptr::write_volatile(ICSR, 1 << 28);
-
-            // The PendSV should switch to task 0, but kernel continues here
-            rprintln!("[SCHED] PendSV completed - now in kernel idle loop");
-            rprintln!("[SCHED] Task 0 should be running on PSP concurrently");
+            let mut scb = cortex_m::Peripherals::take().unwrap().SCB;
+            scb.set_priority(cortex_m::peripheral::scb::SystemHandler::PendSV, 255);
+            scb.set_priority(cortex_m::peripheral::scb::SystemHandler::SysTick, 128);
+            init_systick_1s();
+            enable_systick_interrupt();
         }
 
-        // Kernel idle loop - runs on MSP while tasks run on PSP
-        rprintln!("[SCHED] Kernel entering WFI idle loop (MSP)");
+        // Kernel idle loop - Wait For Interrupt (CPU sleeps until interrupt)
         loop {
             cortex_m::asm::wfi();
         }
     }
 
+
+    static mut FIRST_SWITCH: bool = true;
+
+    #[exception]
+    fn PendSV() {
+        unsafe {
+            cortex_m::peripheral::SCB::clear_pendsv();
+
+            if FIRST_SWITCH {
+                FIRST_SWITCH = false;
+                rprintln!("[PendSV] First switch to Task 0");
+
+                // Get Task 0's stack pointer - this points to control+lr+sw+hw context
+                // For first run, we need to skip to hardware context
+                let task0_sp = TCBS[0].sp;
+                let hw_context_sp = task0_sp + (2 + 10) * 4; // Skip control+lr + r2-r11
+
+                core::arch::asm!(
+                    // Set PSP to Task 0's hardware exception frame
+                    "msr psp, {psp}",
+
+                    // Switch to thread mode using PSP
+                    "mrs r1, control",
+                    "orr r1, r1, #2",         // Use PSP for thread mode
+                    "msr control, r1",
+                    "isb",
+
+                    // Return to thread mode - hardware will restore exception frame
+                    "mov lr, #0xFFFFFFFD",
+                    "bx lr",
+
+                    psp = in(reg) hw_context_sp,
+                    options(noreturn)
+                );
+            } else {
+                // Normal context switching
+                let current_task = CURR;
+                let next_task = (current_task + 1) % N_TASKS;
+
+                rprintln!("[PendSV] Switch: Task {} -> Task {}", current_task, next_task);
+
+                CURR = next_task;
+
+                // Always use initial stack for simplicity - tasks restart fresh
+                let task_sp = TCBS[next_task].sp;
+                let hw_context_sp = task_sp + (2 + 10) * 4; // Skip to hardware context
+
+                core::arch::asm!(
+                    // Set PSP to next task's hardware exception frame
+                    "msr psp, {psp}",
+
+                    // Switch to thread mode using PSP
+                    "mrs r1, control",
+                    "orr r1, r1, #2",         // Use PSP for thread mode
+                    "msr control, r1",
+                    "isb",
+
+                    // Return to thread mode - hardware will restore exception frame
+                    "mov lr, #0xFFFFFFFD",
+                    "bx lr",
+
+                    psp = in(reg) hw_context_sp,
+                    options(noreturn)
+                );
+            }
+        }
+    }
+
+    /*
     global_asm!(
         r#"
-        .global PendSV
-        .type PendSV, %function
-    PendSV:
+        .global PendSV_Handler_DISABLED
+        .type PendSV_Handler_DISABLED, %function
+    PendSV_Handler_DISABLED:
         @ PendSV always runs in privileged mode using MSP (kernel stack)
         @ This preserves kernel context automatically
 
@@ -594,7 +671,7 @@ mod sched {
         stmdb   r0!, {{r4-r11}}
 
         @ Call scheduler to get next task's SP
-        bl      {switch}
+        bl      pend_sv_switch_rust
 
         @ Load new task's context and set PSP
         ldmia   r0!, {{r4-r11}}
@@ -605,7 +682,7 @@ mod sched {
         @ Initial switch from kernel to first task
         @ PSP is 0, so we're switching from MSP (kernel) to PSP (task)
 
-        bl      {switch}
+        bl      pend_sv_switch_rust
 
         @ r0 contains the first task's SP pointing to software context
         @ Load task's software context (r4-r11)
@@ -619,81 +696,27 @@ mod sched {
         orr     r1, r1, #2     @ Use PSP for thread mode
         orr     r1, r1, #1     @ Switch to unprivileged mode
         msr     CONTROL, r1
-        isb
+        isb                    @ Instruction barrier for CONTROL changes
 
-        @ Set return to thread mode with PSP
-        @ Hardware will restore r0-r3,r12,lr,pc,xpsr from PSP stack
-        ldr     lr, =0xFFFFFFFD
+        @ Ensure BASEPRI is cleared for tasks
+        mov     r2, #0
+        msr     basepri, r2
+
+        @ Set return to thread mode with PSP (EXC_RETURN = 0xFFFFFFFD)
+        @ This tells hardware to use PSP for thread mode and restore context
+        movw    lr, #0xFFFD
+        movt    lr, #0xFFFF
         bx      lr
-    "#,
-        switch = sym pend_sv_switch_rust
+    "#
     );
+    */
 
 
-    pub extern "C" fn pend_sv_switch_rust(old_psp: u32) -> u32 {
-        unsafe {
-            let current_task = core::ptr::read_volatile(core::ptr::addr_of!(CURR));
-            rprintln!("[PendSV] ENTRY: old_psp=0x{:08X}, curr={}", old_psp, current_task);
-
-            if old_psp != 0 {
-                rprintln!("[PendSV] Normal switch - saving old PSP");
-                TCBS[current_task].sp = old_psp;
-                let next_task = (current_task + 1) % N_TASKS;
-                core::ptr::write_volatile(core::ptr::addr_of_mut!(CURR), next_task);
-                rprintln!("[PendSV] Switch {} -> {}", current_task, next_task);
-            } else {
-                rprintln!("[PendSV] FIRST SWITCH - old_psp is 0, initializing task 0");
-                rprintln!("[PendSV] Current TCBS[0].sp = 0x{:08X}", TCBS[0].sp);
-            }
-
-            let new_task = core::ptr::read_volatile(core::ptr::addr_of!(CURR));
-            let new_sp = TCBS[new_task].sp;
-            rprintln!("[PendSV] About to load task {} with SP=0x{:08X}", new_task, new_sp);
-
-            // Verify the stack pointer is valid
-            if new_sp < 0x2000_0000 || new_sp >= 0x2002_0000 {
-                rprintln!("[PendSV] ERROR: Invalid SP address! SP=0x{:08X}", new_sp);
-                loop {} // Hang on error
-            }
-
-            // Verify alignment
-            if new_sp & 7 != 0 {
-                rprintln!("[PendSV] ERROR: SP not 8-byte aligned! SP=0x{:08X}", new_sp);
-                loop {} // Hang on error
-            }
-
-            // Check what's at the stack pointer location
-            let sp_ptr = new_sp as *const u32;
-            rprintln!("[PendSV] Stack contents at 0x{:08X}:", new_sp);
-            for i in 0..12 {
-                let val = core::ptr::read_volatile(sp_ptr.add(i));
-                rprintln!("[PendSV]   [{}] = 0x{:08X}", i, val);
-            }
-
-            rprintln!("[PendSV] Assembly will do: add r0, r0, #32 -> PSP=0x{:08X}", new_sp + 32);
-            rprintln!("[PendSV] This should point to HW frame (R0,R1,R2,R3,R12,LR,PC,xPSR)");
-
-            let hw_frame_ptr = (new_sp + 32) as *const u32;
-            rprintln!("[PendSV] HW frame contents at 0x{:08X}:", new_sp + 32);
-            for i in 0..8 {
-                let val = core::ptr::read_volatile(hw_frame_ptr.add(i));
-                let reg_name = match i {
-                    0 => "R0", 1 => "R1", 2 => "R2", 3 => "R3",
-                    4 => "R12", 5 => "LR", 6 => "PC", 7 => "xPSR",
-                    _ => "??"
-                };
-                rprintln!("[PendSV]   {} = 0x{:08X}", reg_name, val);
-            }
-
-            rprintln!("[PendSV] Returning SP=0x{:08X} to assembly", new_sp);
-            new_sp
-        }
-    }
 
     #[exception]
     fn SysTick() {
-        // rprintln!("[SysTick] interrupt fired");
-        unsafe { core::ptr::write_volatile(ICSR, 1 << 28); }
+        // Trigger PendSV every 2 seconds
+        cortex_m::peripheral::SCB::set_pendsv();
     }
 }
 
@@ -702,52 +725,61 @@ mod sched {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn task0_entry() -> ! {
-    // CRITICAL TEST: If we reach here, LED should turn on and stay on
-    unsafe {
-        // Add RTT logging first to confirm we actually reach this function
-        use rtt_target::rprintln;
-        rprintln!("[TASK0] *** TASK0_ENTRY CALLED SUCCESSFULLY! ***");
-        rprintln!("[TASK0] About to turn on LED...");
+    rprintln!("[TASK0] Entry - task switching successful!");
 
-        // Direct GPIO access to avoid any syscall issues
-        use core::ptr::{write_volatile};
-        const GPIOA_BASE: u32 = 0x4002_0000;
-        const BSRR_OFF: u32 = 0x18;
-        let bsrr = (GPIOA_BASE + BSRR_OFF) as *mut u32;
-        write_volatile(bsrr, 1 << 5); // Turn on PA5 (LED)
+    // Turn on LED using syscalls to indicate task is running
+    syscalls().gpio_write(GpioPin::Led1, true);
 
-        rprintln!("[TASK0] LED should be ON now!");
-    }
-
-    // Infinite loop to test if we actually get here
+    // Infinite loop with minimal RTT output
     let mut counter = 0u32;
     loop {
         counter = counter.wrapping_add(1);
-        if counter % 16_000_000 == 0 {
-            use rtt_target::rprintln;
-            rprintln!("[TASK0] Still alive... counter={}", counter);
+
+        // Periodic status update every ~100000 iterations
+        if counter % 100 == 0 {
+            // Silent operation - no RTT output
         }
-        // Do nothing - just keep LED on
+
+        // Small delay to prevent overwhelming the system
+        for _ in 0..1000 {
+            cortex_m::asm::nop();
+        }
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn task1_entry() -> ! {
+    rprintln!("[TASK1] Entry - task1 started!");
+
+    let mut counter = 0u32;
     loop {
-        // Task1 doesn't control LED to avoid conflict with Task0
-        syscalls().sleep_ms(1000);
+        counter = counter.wrapping_add(1);
+
+        if counter % 50 == 0 {
+            // Silent operation - no RTT output
+        }
+
+        // Short delay instead of syscall sleep to avoid blocking
+        for _ in 0..5000 {
+            cortex_m::asm::nop();
+        }
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn task2_entry() -> ! {
-    static mut LAST: u64 = 0;
+    rprintln!("[TASK2] Entry - task2 started!");
+
+    let mut counter = 0u32;
     loop {
-        let _now = syscalls().now_ms();
-        unsafe {
-            LAST = _now;
+        counter = counter.wrapping_add(1);
+
+        if counter % 30 == 0 {
+            // Silent operation - no RTT output
         }
-        for _ in 0..1200 {
+
+        // Short delay
+        for _ in 0..3000 {
             cortex_m::asm::nop();
         }
     }
@@ -768,6 +800,8 @@ fn syscalls() -> &'static mut svc::Client {
         &mut *SYSCALLS_PTR
     }
 }
+
+// LED debugging functions removed - using RTT instead
 
 #[entry]
 fn main() -> ! {
@@ -798,14 +832,12 @@ fn main() -> ! {
         SYSCALLS_PTR = (*client_option_ptr).as_mut().unwrap() as *mut _;
     }
 
-    // LED test removed - now only Task0 will control the LED
+    rprintln!("[MAIN] Board initialization complete");
 
-    rprintln!("[MAIN] About to initialize kernel and tasks");
+    rprintln!("[MAIN] Initializing OS...");
     unsafe {
         sched::init_kernel_and_tasks();
-        rprintln!("[MAIN] Kernel and tasks initialized");
     }
 
-    rprintln!("[MAIN] About to start scheduler");
     sched::start();
 }
