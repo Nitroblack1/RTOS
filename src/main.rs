@@ -806,6 +806,12 @@ fn syscalls() -> &'static mut svc::Client {
 #[entry]
 fn main() -> ! {
     rtt_init_print!();
+
+    // RTT 초기화 확인을 위한 지연
+    for _ in 0..100000 {
+        cortex_m::asm::nop();
+    }
+
     rprintln!("[mini-os] Booting");
 
     unsafe {
