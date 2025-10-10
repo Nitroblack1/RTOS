@@ -677,23 +677,20 @@ mod sched {
 
             if FIRST_SWITCH {
                 FIRST_SWITCH = false;
-                rprintln!("[🚀 FIRST] Switching to Task 0, PSP=0x{:08x}", TCBS[0].sp);
+                // rprintln!("[🚀 START] Task 0");
 
                 // Mark task 0 as running
                 TCBS[0].state = TaskState::Running;
 
                 // Set PSP in global and return r4 pointer
                 NEXT_TASK_PSP = TCBS[0].sp;
-                rprintln!("[📂 RESTORE] Task 0 context: r4-r7=0x{:08x}/0x{:08x}/0x{:08x}/0x{:08x}",
-                         TCBS[0].r4, TCBS[0].r5, TCBS[0].r6, TCBS[0].r7);
                 return core::ptr::addr_of_mut!(TCBS[0].r4);
             } else {
                 // Normal context switching
                 let current_task = CURR;
                 let next_task = (current_task + 1) % N_TASKS;
 
-                rprintln!("[🔄 SWITCH] Task {} → Task {}, PSP: 0x{:08x} → 0x{:08x}",
-                         current_task, next_task, TCBS[current_task].sp, TCBS[next_task].sp);
+                // rprintln!("[🔄 SWITCH] Task {} → Task {}", current_task, next_task);
 
                 // Update task states
                 TCBS[current_task].state = TaskState::Ready;
@@ -703,8 +700,6 @@ mod sched {
 
                 // Set PSP in global and return r4 pointer
                 NEXT_TASK_PSP = TCBS[next_task].sp;
-                rprintln!("[📂 RESTORE] Task {} context: r4-r7=0x{:08x}/0x{:08x}/0x{:08x}/0x{:08x}",
-                         next_task, TCBS[next_task].r4, TCBS[next_task].r5, TCBS[next_task].r6, TCBS[next_task].r7);
                 return core::ptr::addr_of_mut!(TCBS[next_task].r4);
             }
         }
@@ -724,8 +719,14 @@ mod sched {
                 TCBS[current_task].r9 = r9;
                 TCBS[current_task].r10 = r10;
                 TCBS[current_task].r11 = r11;
-                rprintln!("[💾 SAVE] Task {} context: PSP=0x{:08x}, r4-r7=0x{:08x}/0x{:08x}/0x{:08x}/0x{:08x}",
-                         current_task, psp as u32, r4, r5, r6, r7);
+
+                // Show which task was running and a simple progress indicator
+                // match current_task {
+                //     0 => rprintln!("[TASK0] 🔵 Accumulator task was running"),
+                //     1 => rprintln!("[TASK1] 🟡 Fibonacci task was running"),
+                //     2 => rprintln!("[TASK2] 🟣 Sum task was running"),
+                //     _ => {}
+                // }
             }
         }
     }
@@ -829,6 +830,16 @@ mod sched {
 
 // ───────────── TASKS ─────────────
 
+// Global task state variables for reporting
+static mut TASK0_COUNTER: u32 = 1000;
+static mut TASK0_ACCUMULATOR: u32 = 0;
+static mut TASK1_COUNTER: u32 = 2000;
+static mut TASK1_FIB_A: u32 = 0;
+static mut TASK1_FIB_B: u32 = 1;
+static mut TASK1_FIB_COUNT: u32 = 0;
+static mut TASK2_COUNTER: u32 = 3000;
+static mut TASK2_SUM: u32 = 0;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn task0_entry() -> ! {
     rprintln!("[TASK0] Entry - context switching validation started!");
@@ -836,30 +847,29 @@ pub extern "C" fn task0_entry() -> ! {
     // Turn on LED using syscalls to indicate task is running
     syscalls().gpio_write(GpioPin::Led1, true);
 
-    // Test context switching with distinctive counter and computation
-    let mut counter = 1000u32;  // Start with distinctive value
-    let mut accumulator = 0u32;
-    let mut iterations_since_switch = 0u32;
-
     loop {
-        counter = counter.wrapping_add(1);
-        accumulator = accumulator.wrapping_add(counter * 7);  // Distinctive computation
-        iterations_since_switch = iterations_since_switch.wrapping_add(1);
+        unsafe {
+            TASK0_COUNTER = TASK0_COUNTER.wrapping_add(1);
+            TASK0_ACCUMULATOR = TASK0_ACCUMULATOR.wrapping_add(TASK0_COUNTER * 7);
 
-        // Output state to prove continuous execution and context preservation
-        if counter % 25000 == 0 {
-            rprintln!("[TASK0] 🔵 Counter: {}, Accum: 0x{:08x}, Iterations since switch: {}",
-                     counter, accumulator, iterations_since_switch);
-            iterations_since_switch = 0; // Reset after reporting
+            // Show progress with LED patterns (fast feedback)
+            if TASK0_COUNTER % 5000 == 0 {
+                // LED toggle to show task 0 is working
+                syscalls().gpio_toggle(GpioPin::Led1);
+            }
+
+            // Frequent output for quick feedback
+            if TASK0_COUNTER % 500 == 0 {
+                cortex_m::interrupt::disable();
+                let c = core::ptr::read_volatile(core::ptr::addr_of!(TASK0_COUNTER));
+                let a = core::ptr::read_volatile(core::ptr::addr_of!(TASK0_ACCUMULATOR));
+                rprintln!("[DEBUG] Task0 - Counter: {}, Accum: 0x{:08x}", c, a);
+                cortex_m::interrupt::enable();
+            }
         }
 
-        // Show we're actively running between context switches
-        if counter % 10000 == 0 {
-            rprintln!("[TASK0] 🟢 Tick at {}", counter);
-        }
-
-        // Small delay to allow context switching
-        for _ in 0..3000 {
+        // Simple delay
+        for _ in 0..1000 {
             cortex_m::asm::nop();
         }
     }
@@ -869,38 +879,30 @@ pub extern "C" fn task0_entry() -> ! {
 pub extern "C" fn task1_entry() -> ! {
     rprintln!("[TASK1] Entry - fibonacci sequence calculator started!");
 
-    let mut counter = 2000u32;  // Start with different distinctive value
-    let mut fib_a = 0u32;
-    let mut fib_b = 1u32;
-    let mut fib_count = 0u32;
-    let mut work_cycles = 0u32;
-
     loop {
-        counter = counter.wrapping_add(1);
-        work_cycles = work_cycles.wrapping_add(1);
+        unsafe {
+            TASK1_COUNTER = TASK1_COUNTER.wrapping_add(1);
 
-        // Calculate fibonacci sequence (different computation from task0)
-        if counter % 1000 == 0 {
-            let fib_next = fib_a.wrapping_add(fib_b);
-            fib_a = fib_b;
-            fib_b = fib_next;
-            fib_count = fib_count.wrapping_add(1);
+            // Calculate fibonacci sequence every 100 iterations
+            if TASK1_COUNTER % 100 == 0 {
+                let fib_next = TASK1_FIB_A.wrapping_add(TASK1_FIB_B);
+                TASK1_FIB_A = TASK1_FIB_B;
+                TASK1_FIB_B = fib_next;
+                TASK1_FIB_COUNT = TASK1_FIB_COUNT.wrapping_add(1);
+
+                // Quick fibonacci milestones (every 5 calculations)
+                if TASK1_FIB_COUNT % 5 == 0 {
+                    cortex_m::interrupt::disable();
+                    let count = core::ptr::read_volatile(core::ptr::addr_of!(TASK1_FIB_COUNT));
+                    let fib = core::ptr::read_volatile(core::ptr::addr_of!(TASK1_FIB_B));
+                    rprintln!("[DEBUG] Task1 - Fib#{}: {}", count, fib);
+                    cortex_m::interrupt::enable();
+                }
+            }
         }
 
-        // Show detailed state to prove context switching preservation
-        if counter % 20000 == 0 {
-            rprintln!("[TASK1] 🟡 Counter: {}, Fib#{}: {} (a={}, b={}), Work cycles: {}",
-                     counter, fib_count, fib_b, fib_a, fib_b, work_cycles);
-            work_cycles = 0; // Reset after reporting
-        }
-
-        // Show we're alive between major reports
-        if counter % 8000 == 0 {
-            rprintln!("[TASK1] 🟠 Tick at {} (Fib: {})", counter, fib_b);
-        }
-
-        // Short delay to allow context switching
-        for _ in 0..2500 {
+        // Simple delay
+        for _ in 0..1000 {
             cortex_m::asm::nop();
         }
     }
@@ -910,53 +912,23 @@ pub extern "C" fn task1_entry() -> ! {
 pub extern "C" fn task2_entry() -> ! {
     rprintln!("[TASK2] Entry - prime number finder started!");
 
-    let mut counter = 3000u32;  // Start with another distinctive value
-    let mut prime_candidate = 2u32;
-    let mut primes_found = 0u32;
-    let mut last_prime = 0u32;
-    let mut checks_performed = 0u32;
-
     loop {
-        counter = counter.wrapping_add(1);
-        checks_performed = checks_performed.wrapping_add(1);
+        unsafe {
+            TASK2_COUNTER = TASK2_COUNTER.wrapping_add(1);
+            TASK2_SUM = TASK2_SUM.wrapping_add(TASK2_COUNTER);
 
-        // Prime number checking (different computation from other tasks)
-        if counter % 2000 == 0 {
-            prime_candidate = prime_candidate.wrapping_add(1);
-
-            // Simple prime check
-            let mut is_prime = true;
-            if prime_candidate > 2 {
-                for divisor in 2..(prime_candidate / 2 + 1) {
-                    if prime_candidate % divisor == 0 {
-                        is_prime = false;
-                        break;
-                    }
-                    if divisor > 50 { break; } // Limit computation
-                }
-            }
-
-            if is_prime {
-                primes_found = primes_found.wrapping_add(1);
-                last_prime = prime_candidate;
+            // Frequent output for quick feedback
+            if TASK2_COUNTER % 500 == 0 {
+                cortex_m::interrupt::disable();
+                let c = core::ptr::read_volatile(core::ptr::addr_of!(TASK2_COUNTER));
+                let s = core::ptr::read_volatile(core::ptr::addr_of!(TASK2_SUM));
+                rprintln!("[DEBUG] Task2 - Counter: {}, Sum: {}", c, s);
+                cortex_m::interrupt::enable();
             }
         }
 
-        // Show detailed computational state
-        if counter % 30000 == 0 {
-            rprintln!("[TASK2] 🟣 Counter: {}, Primes found: {}, Last prime: {}, Checks: {}",
-                     counter, primes_found, last_prime, checks_performed);
-            checks_performed = 0; // Reset after reporting
-        }
-
-        // Show we're working between reports
-        if counter % 12000 == 0 {
-            rprintln!("[TASK2] 🟤 Tick at {} (checking: {}, found: {} primes)",
-                     counter, prime_candidate, primes_found);
-        }
-
-        // Short delay to allow context switching
-        for _ in 0..2000 {
+        // Simple delay
+        for _ in 0..1000 {
             cortex_m::asm::nop();
         }
     }
