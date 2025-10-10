@@ -411,10 +411,27 @@ mod sched {
     const TASK_STACK_WORDS: usize = 256;
     const KERNEL_STACK_WORDS: usize = 512;  // Kernel needs more stack for complex operations
 
+    #[derive(Copy, Clone, Debug)]
+    pub enum TaskState {
+        Ready,
+        Running,
+        Blocked,
+    }
+
     #[repr(C)]
     #[derive(Copy, Clone)]
     pub struct Tcb {
-        pub sp: u32,
+        pub sp: u32,        // Process Stack Pointer
+        pub r4: u32,        // Callee-saved registers
+        pub r5: u32,
+        pub r6: u32,
+        pub r7: u32,
+        pub r8: u32,
+        pub r9: u32,
+        pub r10: u32,
+        pub r11: u32,
+        pub control: u32,   // CONTROL register value
+        pub state: TaskState,
     }
 
     #[repr(align(8))]
@@ -425,7 +442,12 @@ mod sched {
     #[derive(Copy, Clone)]
     struct KernelStack([u32; KERNEL_STACK_WORDS]);
 
-    static mut TCBS: [Tcb; N_TASKS] = [Tcb { sp: 0 }; N_TASKS];
+    static mut TCBS: [Tcb; N_TASKS] = [Tcb {
+        sp: 0,
+        r4: 0, r5: 0, r6: 0, r7: 0, r8: 0, r9: 0, r10: 0, r11: 0,
+        control: 0x02,  // Use PSP for thread mode
+        state: TaskState::Ready
+    }; N_TASKS];
     static mut TASK_STACKS: [TaskStack; N_TASKS] = [TaskStack([0; TASK_STACK_WORDS]); N_TASKS];
     static mut KERNEL_STACK: KernelStack = KernelStack([0; KERNEL_STACK_WORDS]);
     static mut CURR: usize = 0;
@@ -433,8 +455,8 @@ mod sched {
     const ICSR: *mut u32 = 0xE000_ED04 as *mut u32;
     const SHPR3: *mut u32 = 0xE000_ED20 as *mut u32;
 
-    // Proper stack initialization with both software and hardware context
-    fn init_task_stack(stack: &mut [u32], task_fn: usize) -> u32 {
+    // Initialize task stack and TCB for new context switching approach
+    fn init_task_stack_and_tcb(stack: &mut [u32], task_fn: usize, tcb: &mut Tcb) {
         let len = stack.len();
 
         // Validate task function address
@@ -443,42 +465,34 @@ mod sched {
             loop {}
         }
 
-        // Stack layout: [control+lr] [software context (r2-r11)] [hardware context (r0-r3,r12,lr,pc,xpsr)]
-        // Total: 2 + 10 + 8 = 20 words from top
-        let sp = unsafe { stack.as_ptr().add(len - 20) as u32 };
+        // Stack layout: only hardware context (r0, r1, r2, r3, r12, lr, pc, xpsr) - 8 words from top
+        let sp = unsafe { stack.as_ptr().add(len - 8) as u32 };
 
-        // Initialize CONTROL and EXC_RETURN values
-        let control_frame = unsafe { core::slice::from_raw_parts_mut(sp as *mut u32, 2) };
-        control_frame[0] = 0x02;        // CONTROL: Use PSP for thread mode
-        control_frame[1] = 0xFFFFFFFD;  // EXC_RETURN: Thread mode, PSP, no FPU
+        // Initialize hardware context for exception return
+        let hw_frame = unsafe { core::slice::from_raw_parts_mut(sp as *mut u32, 8) };
+        hw_frame[0] = 0x00000000;                  // r0
+        hw_frame[1] = 0x01010101;                  // r1
+        hw_frame[2] = 0x02020202;                  // r2
+        hw_frame[3] = 0x03030303;                  // r3
+        hw_frame[4] = 0x12121212;                  // r12
+        hw_frame[5] = 0xFFFFFFFE;                  // LR (exception return value)
+        hw_frame[6] = task_fn as u32 | 1;          // PC with Thumb bit
+        hw_frame[7] = 0x01000000;                  // xPSR with Thumb state
 
-        // Initialize software context (r2-r11) - extended from r4-r11 to include r2,r3
-        let sw_frame = unsafe { core::slice::from_raw_parts_mut((sp + 8) as *mut u32, 10) };
-        sw_frame[0] = 0x22222222;  // r2
-        sw_frame[1] = 0x33333333;  // r3
-        sw_frame[2] = 0x44444444;  // r4
-        sw_frame[3] = 0x55555555;  // r5
-        sw_frame[4] = 0x66666666;  // r6
-        sw_frame[5] = 0x77777777;  // r7
-        sw_frame[6] = 0x88888888;  // r8
-        sw_frame[7] = 0x99999999;  // r9
-        sw_frame[8] = 0xAAAAAAAA;  // r10
-        sw_frame[9] = 0xBBBBBBBB;  // r11
-
-        // Initialize hardware context (r0, r1, r12, lr, pc, xpsr) - reduced since r2,r3 moved to SW
-        let hw_frame = unsafe { core::slice::from_raw_parts_mut((sp + 48) as *mut u32, 8) };
-        hw_frame[0] = 0x00000000;  // r0
-        hw_frame[1] = 0x01010101;  // r1
-        hw_frame[2] = 0x02020202;  // r2 (will be overwritten by SW context)
-        hw_frame[3] = 0x03030303;  // r3 (will be overwritten by SW context)
-        hw_frame[4] = 0x12121212;  // r12
-        hw_frame[5] = 0xFFFFFFFE;  // LR (exception return value)
-        hw_frame[6] = task_fn as u32 | 1;  // PC with Thumb bit
-        hw_frame[7] = 0x01000000;  // xPSR with Thumb state
+        // Initialize TCB with software context (callee-saved registers)
+        tcb.sp = sp;                               // PSP points to hardware frame
+        tcb.r4 = 0x44444444;                       // r4
+        tcb.r5 = 0x55555555;                       // r5
+        tcb.r6 = 0x66666666;                       // r6
+        tcb.r7 = 0x77777777;                       // r7
+        tcb.r8 = 0x88888888;                       // r8
+        tcb.r9 = 0x99999999;                       // r9
+        tcb.r10 = 0xAAAAAAAA;                      // r10
+        tcb.r11 = 0xBBBBBBBB;                      // r11
+        tcb.control = 0x02;                        // CONTROL: Use PSP for thread mode
+        tcb.state = TaskState::Ready;
 
         rprintln!("[STACK] Task SP: 0x{:08x}, PC: 0x{:08x}", sp, hw_frame[6]);
-
-        sp
     }
 
     #[unsafe(no_mangle)]
@@ -511,8 +525,7 @@ mod sched {
             // Initialize Task 0
             let task0_addr = task0_entry as usize;
             rprintln!("[SCHED] Task 0 entry point: 0x{:08x}", task0_addr);
-            let p0 = init_task_stack(&mut TASK_STACKS[0].0, task0_addr);
-            TCBS[0].sp = p0;
+            init_task_stack_and_tcb(&mut TASK_STACKS[0].0, task0_addr, &mut TCBS[0]);
 
             // Memory barrier and small delay before next task
             core::arch::asm!("dsb", "isb", options(nomem, nostack));
@@ -523,14 +536,12 @@ mod sched {
             // Initialize Task 1
             let task1_addr = task1_entry as usize;
             rprintln!("[SCHED] Task 1 entry point: 0x{:08x}", task1_addr);
-            let p1 = init_task_stack(&mut TASK_STACKS[1].0, task1_addr);
-            TCBS[1].sp = p1;
+            init_task_stack_and_tcb(&mut TASK_STACKS[1].0, task1_addr, &mut TCBS[1]);
 
             // Initialize Task 2
             let task2_addr = task2_entry as usize;
             rprintln!("[SCHED] Task 2 entry point: 0x{:08x}", task2_addr);
-            let p2 = init_task_stack(&mut TASK_STACKS[2].0, task2_addr);
-            TCBS[2].sp = p2;
+            init_task_stack_and_tcb(&mut TASK_STACKS[2].0, task2_addr, &mut TCBS[2]);
 
             CURR = 0;
 
@@ -590,6 +601,8 @@ mod sched {
 
     static mut FIRST_SWITCH: bool = true;
 
+    /*
+    // Old PendSV - simple restart approach (disabled)
     #[exception]
     fn PendSV() {
         unsafe {
@@ -630,7 +643,7 @@ mod sched {
 
                 CURR = next_task;
 
-                // Always use initial stack for simplicity - tasks restart fresh
+                // Always use initial stack for simplicity - tasks restart fresh ... [TODO]
                 let task_sp = TCBS[next_task].sp;
                 let hw_context_sp = task_sp + (2 + 10) * 4; // Skip to hardware context
 
@@ -654,13 +667,64 @@ mod sched {
             }
         }
     }
+    */
 
-    /*
+    // Context switching Rust helper functions
+    extern "C" fn pend_sv_switch_rust() -> *mut u32 {
+        unsafe {
+            cortex_m::peripheral::SCB::clear_pendsv();
+
+            if FIRST_SWITCH {
+                FIRST_SWITCH = false;
+                rprintln!("[PendSV] First switch to Task 0");
+
+                // Mark task 0 as running
+                TCBS[0].state = TaskState::Running;
+
+                // Return pointer to Task 0's software context (r4-r11)
+                return core::ptr::addr_of_mut!(TCBS[0].r4);
+            } else {
+                // Normal context switching
+                let current_task = CURR;
+                let next_task = (current_task + 1) % N_TASKS;
+
+                rprintln!("[PendSV] Switch: Task {} -> Task {}", current_task, next_task);
+
+                // Update task states
+                TCBS[current_task].state = TaskState::Ready;
+                TCBS[next_task].state = TaskState::Running;
+
+                CURR = next_task;
+
+                // Return pointer to next task's software context
+                return core::ptr::addr_of_mut!(TCBS[next_task].r4);
+            }
+        }
+    }
+
+    extern "C" fn save_current_context_rust(psp: *mut u32, r4: u32, r5: u32, r6: u32, r7: u32, r8: u32, r9: u32, r10: u32, r11: u32) {
+        unsafe {
+            let current_task = CURR;
+            // Save current PSP and software context to TCB
+            TCBS[current_task].sp = psp as u32;
+            TCBS[current_task].r4 = r4;
+            TCBS[current_task].r5 = r5;
+            TCBS[current_task].r6 = r6;
+            TCBS[current_task].r7 = r7;
+            TCBS[current_task].r8 = r8;
+            TCBS[current_task].r9 = r9;
+            TCBS[current_task].r10 = r10;
+            TCBS[current_task].r11 = r11;
+        }
+    }
+
+    use core::arch::global_asm;
+
     global_asm!(
         r#"
-        .global PendSV_Handler_DISABLED
-        .type PendSV_Handler_DISABLED, %function
-    PendSV_Handler_DISABLED:
+        .global PendSV
+        .type PendSV, %function
+    PendSV:
         @ PendSV always runs in privileged mode using MSP (kernel stack)
         @ This preserves kernel context automatically
 
@@ -669,34 +733,53 @@ mod sched {
 
     normal_switch:
         @ Normal task-to-task switch
-        @ PSP points to current task's stack, save its context
-        stmdb   r0!, {{r4-r11}}
+        @ Save current task's software context (r4-r11) to TCB
+        @ Pass PSP and all callee-saved registers to save function
+        push    {{lr}}
+        mov     r1, r4          @ r1 = r4
+        mov     r2, r5          @ r2 = r5
+        mov     r3, r6          @ r3 = r6
+        push    {{r7-r11}}      @ push r7-r11 onto stack for function call
+        bl      {save_context_fn}
+        add     sp, sp, #20     @ clean up stack (5 registers * 4 bytes)
+        pop     {{lr}}
 
-        @ Call scheduler to get next task's SP
-        bl      pend_sv_switch_rust
+        @ Call scheduler to get next task's context pointer
+        push    {{lr}}
+        bl      {switch_fn}
+        pop     {{lr}}
 
-        @ Load new task's context and set PSP
-        ldmia   r0!, {{r4-r11}}
+        @ r0 now points to next task's software context (r4-r11 in TCB)
+        @ Load new task's context directly from TCB
+        ldmia   r0, {{r4-r11}}
+
+        @ Get next task's PSP from TCB (sp field is 9*4 bytes before r4 field)
+        ldr     r0, [r0, #-36]   @ Load sp field (9 fields * 4 bytes before r4)
         msr     psp, r0
+
+        @ Return to thread mode
         bx      lr
 
     first_switch:
         @ Initial switch from kernel to first task
         @ PSP is 0, so we're switching from MSP (kernel) to PSP (task)
 
-        bl      pend_sv_switch_rust
+        @ Call scheduler to get first task's context
+        push    {{lr}}
+        bl      {switch_fn}
+        pop     {{lr}}
 
-        @ r0 contains the first task's SP pointing to software context
-        @ Load task's software context (r4-r11)
-        ldmia   r0!, {{r4-r11}}
+        @ r0 points to first task's software context (r4-r11 in TCB)
+        @ Load task's software context
+        ldmia   r0, {{r4-r11}}
 
-        @ r0 now points to hardware context - this becomes new PSP
+        @ Get task's PSP from TCB (sp field is 9*4 bytes before r4 field)
+        ldr     r0, [r0, #-36]   @ Load sp field
         msr     psp, r0
 
-        @ Switch to unprivileged thread mode using PSP
+        @ Switch to thread mode using PSP
         mrs     r1, CONTROL
         orr     r1, r1, #2     @ Use PSP for thread mode
-        orr     r1, r1, #1     @ Switch to unprivileged mode
         msr     CONTROL, r1
         isb                    @ Instruction barrier for CONTROL changes
 
@@ -705,13 +788,13 @@ mod sched {
         msr     basepri, r2
 
         @ Set return to thread mode with PSP (EXC_RETURN = 0xFFFFFFFD)
-        @ This tells hardware to use PSP for thread mode and restore context
         movw    lr, #0xFFFD
         movt    lr, #0xFFFF
         bx      lr
-    "#
+    "#,
+        switch_fn = sym pend_sv_switch_rust,
+        save_context_fn = sym save_current_context_rust
     );
-    */
 
 
 
@@ -727,41 +810,22 @@ mod sched {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn task0_entry() -> ! {
-    rprintln!("[TASK0] Entry - task switching successful!");
+    rprintln!("[TASK0] Entry - real context switching test!");
 
     // Turn on LED using syscalls to indicate task is running
     syscalls().gpio_write(GpioPin::Led1, true);
 
-    // Infinite loop with minimal RTT output
-    let mut counter = 0u32;
+    // Test context switching by using distinct counter values
+    let mut counter = 1000u32;  // Start with distinctive value
     loop {
         counter = counter.wrapping_add(1);
 
-        // Periodic status update every ~100000 iterations
-        if counter % 100 == 0 {
-            // Silent operation - no RTT output
+        // Output counter to verify task resumes from correct state
+        if counter % 50000 == 0 {
+            rprintln!("[TASK0] Counter: {}", counter);
         }
 
-        // Small delay to prevent overwhelming the system
-        for _ in 0..1000 {
-            cortex_m::asm::nop();
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn task1_entry() -> ! {
-    rprintln!("[TASK1] Entry - task1 started!");
-
-    let mut counter = 0u32;
-    loop {
-        counter = counter.wrapping_add(1);
-
-        if counter % 50 == 0 {
-            // Silent operation - no RTT output
-        }
-
-        // Short delay instead of syscall sleep to avoid blocking
+        // Small delay to allow context switching
         for _ in 0..5000 {
             cortex_m::asm::nop();
         }
@@ -769,19 +833,38 @@ pub extern "C" fn task1_entry() -> ! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn task2_entry() -> ! {
-    rprintln!("[TASK2] Entry - task2 started!");
+pub extern "C" fn task1_entry() -> ! {
+    rprintln!("[TASK1] Entry - task1 context switching test!");
 
-    let mut counter = 0u32;
+    let mut counter = 2000u32;  // Start with different distinctive value
     loop {
         counter = counter.wrapping_add(1);
 
-        if counter % 30 == 0 {
-            // Silent operation - no RTT output
+        if counter % 30000 == 0 {
+            rprintln!("[TASK1] Counter: {}", counter);
         }
 
-        // Short delay
+        // Short delay to allow context switching
         for _ in 0..3000 {
+            cortex_m::asm::nop();
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn task2_entry() -> ! {
+    rprintln!("[TASK2] Entry - task2 context switching test!");
+
+    let mut counter = 3000u32;  // Start with another distinctive value
+    loop {
+        counter = counter.wrapping_add(1);
+
+        if counter % 40000 == 0 {
+            rprintln!("[TASK2] Counter: {}", counter);
+        }
+
+        // Short delay to allow context switching
+        for _ in 0..4000 {
             cortex_m::asm::nop();
         }
     }
