@@ -12,6 +12,9 @@ halt_afterwards = true      # 리셋 직후 코어 halt
 
 [default.rtt]
 enabled = true
+up_mode = "NoBlockSkip"
+timeout = 3000
+log_enabled = false
 
 [default.gdb]
 enabled = false

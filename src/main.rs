@@ -1,45 +1,282 @@
-// mini_os_app_framework.rs (Button-controlled app switching, STM32F446)
-// - Board: STM32F446 (e.g., Nucleo-F446RE)
+// mini_os_app_framework.rs
 #![no_std]
 #![no_main]
 #![allow(dead_code)]
 
-
 use cortex_m_rt::entry;
 use panic_halt as _;
 use rtt_target::{rprintln, rtt_init_print};
+use stm32f4 as _; // Required for memory layout and vector table
 
-// ------------------------- SVC layer ------------------------
-mod svc {
-    // --------------------- for rtt debug ----------------------
-    use core::sync::atomic::{ AtomicU32, Ordering };
 
-    static SVC_COUNTER: AtomicU32 = AtomicU32::new(0);
-    static NOW_COUNT: AtomicU32 = AtomicU32::new(0);
-    static BTN_COUNT: AtomicU32 = AtomicU32::new(0);
+// for debug
+#[cortex_m_rt::exception]
+unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
+    rprintln!("[FATAL] HardFault occurred at PC: 0x{:08x}", ef.pc());
+    loop {}
+}
 
-    pub fn svc_stats() -> (u32, u32, u32) {
-        (
-            SVC_COUNTER.load(Ordering::Relaxed),
-            NOW_COUNT.load(Ordering::Relaxed),
-            BTN_COUNT.load(Ordering::Relaxed),
-        )
+#[cortex_m_rt::exception]
+unsafe fn UsageFault() -> ! {
+    rprintln!("[FATAL] UsageFault occurred");
+    loop {}
+}
+
+#[cortex_m_rt::exception]
+unsafe fn MemoryManagement() -> ! {
+    rprintln!("[FATAL] MemoryManagement fault occurred");
+    loop {}
+}
+// for debug
+
+const CYCLES_PER_MS_ESTIMATE: u32 = 16_000;
+
+#[derive(Copy, Clone, Debug)]
+pub enum GpioPin {
+    Led1,
+}
+
+pub trait Syscalls {
+    fn gpio_write(&mut self, pin: GpioPin, high: bool);
+    fn gpio_toggle(&mut self, pin: GpioPin);
+    fn sleep_ms(&mut self, ms: u32);
+    fn now_ms(&self) -> u64;
+}
+
+#[inline(always)]
+fn gpio_pin_to_idx(pin: GpioPin) -> u32 {
+    match pin {
+        GpioPin::Led1 => 0,
     }
-    // --------------------- end rtt debug ----------------------
+}
 
-    use core::arch::{ asm, global_asm };
-    use crate::os::Syscalls;
+// ───────────── BOARD LAYER ─────────────
 
-    // --------- ABI : call_id definitions ----------
+mod board {
+    use core::ptr::{read_volatile, write_volatile};
+    use crate::{GpioPin, Syscalls};
+    use cortex_m::asm::nop;
+
+    const RCC_BASE: u32 = 0x4002_3800;
+    const RCC_AHB1ENR: *mut u32 = (RCC_BASE + 0x30) as *mut u32;
+
+    pub const GPIOA_BASE: u32 = 0x4002_0000;
+    pub const GPIOC_BASE: u32 = 0x4002_0800;
+
+    const MODER_OFF: u32 = 0x00;
+    const OTYPER_OFF: u32 = 0x04;
+    const PUPDR_OFF: u32 = 0x0C;
+    const IDR_OFF: u32 = 0x10;
+    const ODR_OFF: u32 = 0x14;
+    const BSRR_OFF: u32 = 0x18;
+
+    #[inline(always)]
+    const fn reg32(addr: u32) -> *mut u32 {
+        addr as *mut u32
+    }
+
+    unsafe fn gpio_enable_clock(port_base: u32) {
+        let bit = match port_base {
+            GPIOA_BASE => 0,
+            GPIOC_BASE => 2,
+            _ => unreachable!(),
+        };
+        let mut v = unsafe { read_volatile(RCC_AHB1ENR) };
+        v |= 1 << bit;
+        unsafe { write_volatile(RCC_AHB1ENR, v); }
+        for _ in 0..128 {
+            nop();
+        }
+    }
+
+    unsafe fn gpio_set_output(port_base: u32, pin: u8) {
+        let shift = (pin as u32) * 2;
+
+        let moder = reg32(port_base + MODER_OFF);
+        let mut v = unsafe { read_volatile(moder) };
+        v &= !(0b11 << shift);
+        v |= 0b01 << shift;
+        unsafe { write_volatile(moder, v) };
+
+        let otyper = reg32(port_base + OTYPER_OFF);
+        let mut v = unsafe { read_volatile(otyper) };
+        v &= !(1 << pin);
+        unsafe { write_volatile(otyper, v) };
+
+        let pupdr = reg32(port_base + PUPDR_OFF);
+        let mut v = unsafe { read_volatile(pupdr) };
+        v &= !(0b11 << shift);
+        unsafe { write_volatile(pupdr, v) };
+    }
+
+    unsafe fn gpio_set_input_pullup(port_base: u32, pin: u8) {
+        let shift = (pin as u32) * 2;
+
+        let moder = reg32(port_base + MODER_OFF);
+        let mut v = unsafe { read_volatile(moder) };
+        v &= !(0b11 << shift);
+        unsafe { write_volatile(moder, v) };
+
+        let pupdr = reg32(port_base + PUPDR_OFF);
+        let mut v = unsafe { read_volatile(pupdr) };
+        v &= !(0b11 << shift);
+        v |= 0b01 << shift;
+        unsafe { write_volatile(pupdr, v) };
+    }
+
+    unsafe fn gpio_write(port_base: u32, pin: u8, high: bool) {
+        let bsrr = reg32(port_base + BSRR_OFF);
+        let val = if high { 1u32 << pin } else { 1u32 << (pin + 16) };
+        unsafe { write_volatile(bsrr, val) };
+    }
+
+    unsafe fn gpio_toggle(port_base: u32, pin: u8) {
+        let odr = reg32(port_base + ODR_OFF);
+        let cur = unsafe { read_volatile(odr) };
+        unsafe { gpio_write(port_base, pin, ((cur >> pin) & 1) == 0); }
+    }
+
+    pub struct RawPin {
+        pub(crate) port_base: u32,
+        pub(crate) pin: u8,
+    }
+
+    impl RawPin {
+        pub const fn new(port_base: u32, pin: u8) -> Self {
+            Self { port_base, pin }
+        }
+    }
+
+    pub struct BoardSyscalls {
+        led1: RawPin,
+        btn: RawPin,
+        time_ms: u64,
+        cycles_per_ms: u32,
+    }
+
+    impl BoardSyscalls {
+        pub const fn new(led1: RawPin, btn: RawPin, cycles_per_ms: u32) -> Self {
+            Self {
+                led1,
+                btn,
+                time_ms: 0,
+                cycles_per_ms,
+            }
+        }
+
+        pub unsafe fn init(&mut self) {
+            unsafe { gpio_enable_clock(GPIOA_BASE); }
+            unsafe { gpio_enable_clock(GPIOC_BASE); }
+            unsafe { gpio_set_output(self.led1.port_base, self.led1.pin); }
+            unsafe { gpio_set_input_pullup(self.btn.port_base, self.btn.pin); }
+        }
+
+        fn spin_delay(&mut self, ms: u32) {
+            for _ in 0..ms {
+                for _ in 0..self.cycles_per_ms {
+                    nop();
+                }
+                self.time_ms = self.time_ms.wrapping_add(1);
+            }
+        }
+    }
+
+    impl Syscalls for BoardSyscalls {
+        fn gpio_write(&mut self, pin: GpioPin, high: bool) {
+            unsafe {
+                match pin {
+                    GpioPin::Led1 => gpio_write(self.led1.port_base, self.led1.pin, high),
+                }
+            }
+        }
+
+        fn gpio_toggle(&mut self, pin: GpioPin) {
+            unsafe {
+                match pin {
+                    GpioPin::Led1 => gpio_toggle(self.led1.port_base, self.led1.pin),
+                }
+            }
+        }
+
+        fn sleep_ms(&mut self, ms: u32) {
+            self.spin_delay(ms);
+        }
+
+        fn now_ms(&self) -> u64 {
+            self.time_ms
+        }
+    }
+
+    pub struct GpioPriv {
+        pub(crate) port_base: u32,
+        pub(crate) pin: u8,
+    }
+
+    impl GpioPriv {
+        pub const unsafe fn new_privileged_const(port_base: u32, pin: u8) -> Self {
+            Self { port_base, pin }
+        }
+
+        #[inline]
+        pub fn write(&self, high: bool) {
+            unsafe { gpio_write(self.port_base, self.pin, high) };
+        }
+
+        #[inline]
+        pub fn toggle(&self) {
+            unsafe { gpio_toggle(self.port_base, self.pin) };
+        }
+    }
+
+    pub const GPIOA: u32 = GPIOA_BASE;
+    pub const GPIOC: u32 = GPIOC_BASE;
+}
+
+// ───────────── CAPSULES ─────────────
+mod capsules {
+    #![forbid(unsafe_code)]
+
+    use crate::{board, GpioPin};
+
+    pub struct MuxGpio {
+        led1: &'static board::GpioPriv,
+        led2: &'static board::GpioPriv,
+    }
+
+    impl MuxGpio {
+        pub const fn new(led1: &'static board::GpioPriv, led2: &'static board::GpioPriv) -> Self {
+            Self { led1, led2 }
+        }
+
+        #[inline]
+        pub fn write(&self, pin: GpioPin, high: bool) {
+            match pin {
+                GpioPin::Led1 => self.led1.write(high),
+            }
+        }
+
+        pub fn toggle(&self, pin: GpioPin) {
+            match pin {
+                GpioPin::Led1 => self.led1.toggle(),
+            }
+        }
+    }
+}
+
+// ───────────── SVC ─────────────
+mod svc {
+    use core::arch::{asm, global_asm};
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::{GpioPin, Syscalls};
+
     pub mod abi {
         pub const NOW_MS: u8 = 1;
-        pub const BTN_PRESSED: u8 = 2;
-        pub const GPIO_WRITE: u8 = 3;
-        pub const GPIO_TOGGLE: u8 = 4;
-        pub const SLEEP_MS: u8 = 5;
+        pub const GPIO_WRITE: u8 = 2;
+        pub const GPIO_TOGGLE: u8 = 3;
+        pub const SLEEP_MS: u8 = 4;
     }
 
-    // --------- 공용 SVC call wrapper ----------------
     #[inline(always)]
     pub fn svc_call(call_id: u8, a0: u32, a1: u32, a2: u32, a3: u32) -> u32 {
         let mut r0 = call_id as u32;
@@ -57,8 +294,16 @@ mod svc {
         r0
     }
 
-    // --------- (1) ExceptionFrame 구조체 정의 ----------
-    // 참고: https://interrupt.memfault.com/blog/cortex-m-exception-handling
+    static SVC_COUNTER: AtomicU32 = AtomicU32::new(0);
+    static NOW_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    pub fn svc_stats() -> (u32, u32) {
+        (
+            SVC_COUNTER.load(Ordering::Relaxed),
+            NOW_COUNT.load(Ordering::Relaxed),
+        )
+    }
+
     #[repr(C)]
     pub struct ExceptionFrame {
         pub r0: u32,
@@ -71,485 +316,683 @@ mod svc {
         pub xpsr: u32,
     }
 
-    // --------- (2) SVC 핸들러 어셈블리: ExceptionFrame 포인터를 인수로 전달 ----------
     global_asm!(
         r#"
         .global SVCall
         .type   SVCall, %function
     SVCall:
-        tst     lr, #4      // EXC_RETURN bit 2: 0=MSP, 1=PSP
-        ite     eq          // if-then-else
-        mrseq   r0, msp    // r0 = stack ptr (MSP or PSP)
-        mrsne   r0, psp    // (on thread mode)
-        b       {svcrust}  // call Rust handler
+        tst     lr, #4
+        ite     eq
+        mrseq   r0, msp
+        mrsne   r0, psp
+        b       {svcrust}
     "#,
-        svcrust = sym crate::svc::svcall_rust
+        svcrust = sym svcall_rust
     );
 
-    // --------- (3) SVC 핸들러: ExceptionFrame 포인터 인수로 받음 ----------
     extern "C" fn svcall_rust(frame: &mut ExceptionFrame) {
         let call_id = (frame.r0 & 0xFF) as u8;
 
-        // ------------------ for rtt debug -------------------
+
         SVC_COUNTER.fetch_add(1, Ordering::Relaxed);
-        match call_id {
-            abi::NOW_MS => { NOW_COUNT.fetch_add(1, Ordering::Relaxed); }
-            abi::BTN_PRESSED => { BTN_COUNT.fetch_add(1, Ordering::Relaxed); }
-            _ => {}
+        if call_id == abi::NOW_MS {
+            NOW_COUNT.fetch_add(1, Ordering::Relaxed);
         }
-        // ---------------- end rtt debug ---------------------
 
-        let a0 = frame.r1;
-        let a1 = frame.r2;
-        let a2 = frame.r3;
-        let a3 = frame.r12;
-
-        let ret = unsafe { kernel_dispatch(call_id, a0, a1, a2, a3) };
+        let ret = unsafe {
+            kernel_dispatch(call_id, frame.r1, frame.r2, frame.r3, frame.r12)
+        };
         frame.r0 = ret;
     }
 
-    // --------- (4) 커널(Board) 접근 포인터 등록 ----------
     static mut BOARD_PTR: *mut crate::board::BoardSyscalls = core::ptr::null_mut();
+
     pub unsafe fn register_kernel_board(p: *mut crate::board::BoardSyscalls) {
-        unsafe { BOARD_PTR = p };
+        unsafe { BOARD_PTR = p; }
     }
 
-    // --------- (5) 실제 디스패처: 지금은 NOW_MS만 처리 ----------
     unsafe fn kernel_dispatch(call_id: u8, a0: u32, a1: u32, _a2: u32, _a3: u32) -> u32 {
         let board = unsafe { &mut *BOARD_PTR };
         match call_id {
             abi::NOW_MS => board.now_ms() as u32,
-
-            abi::BTN_PRESSED => {
-                if board.user_button_pressed() { 1 } else { 0 }
-            },
-
             abi::GPIO_WRITE => {
-                let pin_enum = if a0 == 0 { crate::os::GpioPin::Led1 } 
-                                        else { crate::os::GpioPin::Led2 };
-                board.gpio_write(pin_enum, a1 != 0);
+                board.gpio_write(GpioPin::Led1, a1 != 0);
                 0
             }
-
             abi::GPIO_TOGGLE => {
-                let pin_enum = if a0 == 0 { crate::os::GpioPin::Led1 } else { crate::os::GpioPin::Led2 };
-                board.gpio_toggle(pin_enum);
+                board.gpio_toggle(GpioPin::Led1);
                 0
             }
-
             abi::SLEEP_MS => {
                 board.sleep_ms(a0);
                 0
             }
-
-            _ => 0xFFFF_FFFF, // unknown
+            _ => 0xFFFF_FFFF,
         }
     }
 
-    // --------- (6) Syscalls용 SVC 클라이언트 래퍼 ----------
-    // fallback을 위해 보드 포인터 보관 (raw pointer로 보관: 빌림 충돌 회피)
     pub struct Client {
-        board: *mut crate::board::BoardSyscalls
+        board: *mut crate::board::BoardSyscalls,
     }
+
     impl Client {
         pub unsafe fn new(board: &mut crate::board::BoardSyscalls) -> Self {
             Self { board: board as *mut _ }
         }
     }
 
-    // 기존 os::Syscalls 트레이트를 이 클라이언트가 구현
-    impl crate::os::Syscalls for Client {
+    impl Syscalls for Client {
         fn now_ms(&self) -> u64 {
             svc_call(abi::NOW_MS, 0, 0, 0, 0) as u64
         }
+
         fn sleep_ms(&mut self, ms: u32) {
             let _ = svc_call(abi::SLEEP_MS, ms, 0, 0, 0);
         }
-        fn gpio_write(&mut self, pin: crate::os::GpioPin, high: bool) {
-            let p = match pin {
-                crate::os::GpioPin::Led1 => 0u32,
-                crate::os::GpioPin::Led2 => 1u32,
-            };
-            let h = if high { 1u32 } else { 0u32 };
-            let _ = svc_call(abi::GPIO_WRITE, p, h, 0, 0);
+
+        fn gpio_write(&mut self, _pin: GpioPin, high: bool) {
+            let _ = svc_call(abi::GPIO_WRITE, 0, high as u32, 0, 0);
         }
-        fn gpio_toggle(&mut self, pin: crate::os::GpioPin) {
-            let p = match pin {
-                crate::os::GpioPin::Led1 => 0u32,
-                crate::os::GpioPin::Led2 => 1u32,
-            };
-            let _ = svc_call(abi::GPIO_TOGGLE, p, 0, 0, 0);
-        }
-        fn user_button_pressed(&self) -> bool {
-            svc_call(abi::BTN_PRESSED, 0, 0, 0, 0) != 0
+
+        fn gpio_toggle(&mut self, _pin: GpioPin) {
+            let _ = svc_call(abi::GPIO_TOGGLE, 0, 0, 0, 0);
         }
     }
 }
 
-// ------------------------- OS Core -------------------------
-mod os {
-    #[derive(Copy, Clone, Debug)]
-    pub enum GpioPin { Led1, Led2 }
+// ───────────── SCHEDULER & TASKS ─────────────
 
-    pub trait Syscalls {
-        fn gpio_write(&mut self, pin: GpioPin, high: bool);
-        fn gpio_toggle(&mut self, pin: GpioPin);
-        fn sleep_ms(&mut self, ms: u32);
-        fn now_ms(&self) -> u64;
-        fn user_button_pressed(&self) -> bool; // ← Board input exposed as a syscall
-    }
-
-    pub trait App {
-        fn name(&self) -> &'static str;
-        fn init(&mut self, _sys: &mut dyn Syscalls) {}
-        fn tick(&mut self, sys: &mut dyn Syscalls);
-    }
-
-    pub enum AppCall<'a> {
-        ByName(&'a str),
-        ByIndex(usize),
-        All,
-        /// Run `primary` app while button is released; run `secondary` while pressed.
-        SwitchOnButton { primary: usize, secondary: usize },
-    }
-
-    pub struct Os<'a> {
-        apps: &'a mut [&'a mut dyn App],
-        sys: &'a mut dyn Syscalls,
-        started: bool,
-    }
-
-    impl<'a> Os<'a> {
-        pub fn new(apps: &'a mut [&'a mut dyn App], sys: &'a mut dyn Syscalls) -> Self {
-            Self { apps, sys, started: false }
-        }
-        pub fn run(&'a mut self, call: AppCall<'a>) -> ! {
-            // One-time init for all apps
-            if !self.started { for a in self.apps.iter_mut() { a.init(self.sys); } self.started = true; }
-
-            assert!(!self.apps.is_empty(), "no apps to run");
-
-            match call {
-                AppCall::ByIndex(mut i) => {
-                    i %= self.apps.len();
-                    loop { self.apps[i].tick(self.sys); }
-                }
-                AppCall::ByName(name) => {
-                    let mut idx = 0usize;
-                    for (i, a) in self.apps.iter().enumerate() { if a.name() == name { idx = i; break; } }
-                    loop { self.apps[idx].tick(self.sys); }
-                }
-                AppCall::All => {
-                    loop { for a in self.apps.iter_mut() { a.tick(self.sys); } }
-                }
-                AppCall::SwitchOnButton { mut primary, mut secondary } => {
-                    let len = self.apps.len();
-                    primary %= len; secondary %= len;
-                    loop {
-                        if self.sys.user_button_pressed() {
-                            self.apps[secondary].tick(self.sys);
-                        } else {
-                            self.apps[primary].tick(self.sys);
-                        }
-                        self.sys.sleep_ms(1); // debounce / cooperative yield
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ------------------------- Apps ----------------------------
-mod apps {
-    use super::os::{App, GpioPin, Syscalls};
+mod sched {
+    use cortex_m_rt::exception;
+    use crate::{task0_entry, task1_entry, task2_entry};
     use rtt_target::rprintln;
 
-    /// Heartbeat: steady blink on PA5 (both Led1/Led2 mapped) to show liveness.
-    pub struct HeartbeatApp { last: u64, on: bool, period_ms: u32, dbg_last_log: u64 }
-    impl HeartbeatApp {
-        pub const fn new(period_ms: u32) -> Self {
-             Self { last: 0, on: false, period_ms, dbg_last_log: 0 } 
-            } 
-    }
-    impl App for HeartbeatApp {
-        fn name(&self) -> &'static str { "heartbeat" }
-        fn tick(&mut self, sys: &mut dyn Syscalls) {
-            let now = sys.now_ms();
-            if now.wrapping_sub(self.last) >= self.period_ms as u64 {
-                self.on = !self.on;
-                sys.gpio_write(GpioPin::Led1, self.on);
-                sys.gpio_write(GpioPin::Led2, self.on);
-                self.last = now;
-            }
+    pub const N_TASKS: usize = 3;
+    const TASK_STACK_WORDS: usize = 256;
+    const KERNEL_STACK_WORDS: usize = 512;  // Kernel needs more stack for complex operations
 
-            // ---- for rtt debug: 1초마다 SVC 통계 출력 ---
-            if now.wrapping_sub(self.dbg_last_log) >= 1000 {
-                let (svc, nowc, btnc) = crate::svc::svc_stats();
-                rprintln!("SVC hits: total={}, now_ms={}, btn={}", svc, nowc, btnc);
-                self.dbg_last_log = now;
-            }
-            // ------------------------------------------
-
-            sys.sleep_ms(1);
-        }
+    #[derive(Copy, Clone, Debug)]
+    pub enum TaskState {
+        Ready,
+        Running,
+        Blocked,
     }
 
-    /// SOS pattern on PA5: ··· ––– ···, repeats
-    pub struct LedSosApp;
-    impl LedSosApp { pub const fn new() -> Self { Self } }
-    impl App for LedSosApp {
-        fn name(&self) -> &'static str { "led_sos" }
-        fn tick(&mut self, sys: &mut dyn Syscalls) {
-            const DOT: u32 = 2; const DASH: u32 = 6; const GAP: u32 = 2; const WORD: u32 = 7;
-            let mut pulse = |dur: u32| {
-                sys.gpio_write(GpioPin::Led2, true);  sys.sleep_ms(dur);
-                sys.gpio_write(GpioPin::Led2, false); sys.sleep_ms(GAP);
-            };
-            for _ in 0..2 { pulse(DOT); }
-            for _ in 0..2 { pulse(DASH); }
-            for _ in 0..2 { pulse(DOT); }
-            sys.sleep_ms(WORD);
-        }
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct Tcb {
+        pub sp: u32,        // Process Stack Pointer
+        pub r4: u32,        // Callee-saved registers
+        pub r5: u32,
+        pub r6: u32,
+        pub r7: u32,
+        pub r8: u32,
+        pub r9: u32,
+        pub r10: u32,
+        pub r11: u32,
+        pub control: u32,   // CONTROL register value
+        pub state: TaskState,
     }
 
-}
+    #[repr(align(8))]
+    #[derive(Copy, Clone)]
+    struct TaskStack([u32; TASK_STACK_WORDS]);
 
-// -------------- Board layer: STM32F446 raw registers ---------
-mod board {
-    use core::ptr::{read_volatile, write_volatile};
-    use super::os::{GpioPin, Syscalls};
-    use cortex_m::asm::nop;
+    #[repr(align(8))]
+    #[derive(Copy, Clone)]
+    struct KernelStack([u32; KERNEL_STACK_WORDS]);
 
-    // --- RCC base (STM32F4xx) ---
-    const RCC_BASE: u32 = 0x4002_3800;
-    const RCC_AHB1ENR: *mut u32 = (RCC_BASE + 0x30) as *mut u32; // GPIOxEN bits
+    static mut TCBS: [Tcb; N_TASKS] = [Tcb {
+        sp: 0,
+        r4: 0, r5: 0, r6: 0, r7: 0, r8: 0, r9: 0, r10: 0, r11: 0,
+        control: 0x02,  // Use PSP for thread mode
+        state: TaskState::Ready
+    }; N_TASKS];
+    static mut TASK_STACKS: [TaskStack; N_TASKS] = [TaskStack([0; TASK_STACK_WORDS]); N_TASKS];
+    static mut KERNEL_STACK: KernelStack = KernelStack([0; KERNEL_STACK_WORDS]);
+    static mut CURR: usize = 0;
 
-    // --- GPIO base ---
-    pub const GPIOA_BASE: u32 = 0x4002_0000;
-    pub const GPIOC_BASE: u32 = 0x4002_0800;
+    const ICSR: *mut u32 = 0xE000_ED04 as *mut u32;
+    const SHPR3: *mut u32 = 0xE000_ED20 as *mut u32;
 
-    // Offsets (only what we use)
-    const MODER_OFF:  u32 = 0x00;
-    const OTYPER_OFF: u32 = 0x04;
-    const PUPDR_OFF:  u32 = 0x0C;
-    const IDR_OFF:    u32 = 0x10;
-    const ODR_OFF:    u32 = 0x14;
-    const BSRR_OFF:   u32 = 0x18;
+    // Initialize task stack and TCB for new context switching approach
+    fn init_task_stack_and_tcb(stack: &mut [u32], task_fn: usize, tcb: &mut Tcb) {
+        let len = stack.len();
 
-    #[inline(always)]
-    const fn reg32(addr: u32) -> *mut u32 { addr as *mut u32 }
-
-    unsafe fn gpio_enable_clock(port_base: u32) {
-        // AHB1ENR: bit0=GPIOA, bit2=GPIOC
-        let bit = match port_base { GPIOA_BASE => 0, GPIOC_BASE => 2, _ => unreachable!() };
-        let mut v = unsafe { read_volatile(RCC_AHB1ENR) };
-        v |= 1 << bit;
-        unsafe { write_volatile(RCC_AHB1ENR, v) };
-        for _ in 0..128 { nop(); }
-    }
-
-    unsafe fn gpio_set_output(port_base: u32, pin: u8) {
-        // MODER: 01 = output
-        let moder = reg32(port_base + MODER_OFF);
-        let mut v = unsafe { read_volatile(moder) };
-        let shift = (pin as u32) * 2;
-        v &= !(0b11 << shift);
-        v |=  0b01 << shift;
-        unsafe { write_volatile(moder, v) };
-
-        // OTYPER: push-pull
-        let otyper = reg32(port_base + OTYPER_OFF);
-        let mut v = unsafe { read_volatile(otyper) };
-        v &= !(1 << pin);
-        unsafe { write_volatile(otyper, v) };
-
-        // PUPDR: no pull
-        let pupdr = reg32(port_base + PUPDR_OFF);
-        let mut v = unsafe { read_volatile(pupdr) };
-        let shift2 = (pin as u32) * 2;
-        v &= !(0b11 << shift2);
-        unsafe { write_volatile(pupdr, v) };
-    }
-
-    unsafe fn gpio_set_input_pullup(port_base: u32, pin: u8) {
-        // MODER: 00 = input
-        let moder = reg32(port_base + MODER_OFF);
-        let mut v = unsafe { read_volatile(moder) };
-        let shift = (pin as u32) * 2;
-        v &= !(0b11 << shift);
-        unsafe { write_volatile(moder, v) };
-
-        // PUPDR: 01 = pull-up
-        let pupdr = reg32(port_base + PUPDR_OFF);
-        let mut v = unsafe { read_volatile(pupdr) };
-        v &= !(0b11 << shift);
-        v |=  0b01 << shift;
-        unsafe { write_volatile(pupdr, v) };
-    }
-
-    unsafe fn gpio_write(port_base: u32, pin: u8, high: bool) {
-        let bsrr = reg32(port_base + BSRR_OFF);
-        let val = if high { 1u32 << pin } else { 1u32 << (pin + 16) };
-        unsafe { write_volatile(bsrr, val) };
-    }
-
-    unsafe fn gpio_toggle(port_base: u32, pin: u8) {
-        let odr = reg32(port_base + ODR_OFF);
-        let cur = unsafe { read_volatile(odr) };
-        let high = ((cur >> pin) & 1) == 0;
-        unsafe { gpio_write(port_base, pin, high) };
-    }
-
-    unsafe fn gpio_read_input(port_base: u32, pin: u8) -> bool {
-        let idr = reg32(port_base + IDR_OFF);
-        let v = unsafe { read_volatile(idr) };
-        ((v >> pin) & 1) != 0
-    }
-
-    pub struct RawPin { pub(crate) port_base: u32, pub(crate) pin: u8 }
-    impl RawPin { pub const fn new(port_base: u32, pin: u8) -> Self { Self { port_base, pin } } }
-
-    pub struct BoardSyscalls {
-        led1: RawPin, // PA5
-        led2: RawPin, // PA5
-        btn:  RawPin, // PC13
-        time_ms: u64,
-        cycles_per_ms: u32,
-    }
-
-    impl BoardSyscalls {
-        pub const fn new(led1: RawPin, led2: RawPin, btn: RawPin, cycles_per_ms: u32) -> Self {
-            Self { led1, led2, btn, time_ms: 0, cycles_per_ms }
+        // Validate task function address
+        if (task_fn as u32) < 0x08000000 || (task_fn as u32) >= 0x08100000 {
+            rprintln!("[FATAL] Invalid task function: 0x{:08x}", task_fn);
+            loop {}
         }
 
-        pub unsafe fn init(&mut self) {
+        // Stack layout: only hardware context (r0, r1, r2, r3, r12, lr, pc, xpsr) - 8 words from top
+        let sp = unsafe { stack.as_ptr().add(len - 8) as u32 };
+
+        // Initialize hardware context for exception return
+        let hw_frame = unsafe { core::slice::from_raw_parts_mut(sp as *mut u32, 8) };
+        hw_frame[0] = 0x00000000;                  // r0
+        hw_frame[1] = 0x01010101;                  // r1
+        hw_frame[2] = 0x02020202;                  // r2
+        hw_frame[3] = 0x03030303;                  // r3
+        hw_frame[4] = 0x12121212;                  // r12
+        hw_frame[5] = 0xFFFFFFFE;                  // LR (exception return value)
+        hw_frame[6] = task_fn as u32 | 1;          // PC with Thumb bit
+        hw_frame[7] = 0x01000000;                  // xPSR with Thumb state
+
+        // Initialize TCB with software context (callee-saved registers)
+        tcb.sp = sp;                               // PSP points to hardware frame
+        tcb.r4 = 0x44444444;                       // r4
+        tcb.r5 = 0x55555555;                       // r5
+        tcb.r6 = 0x66666666;                       // r6
+        tcb.r7 = 0x77777777;                       // r7
+        tcb.r8 = 0x88888888;                       // r8
+        tcb.r9 = 0x99999999;                       // r9
+        tcb.r10 = 0xAAAAAAAA;                      // r10
+        tcb.r11 = 0xBBBBBBBB;                      // r11
+        tcb.control = 0x02;                        // CONTROL: Use PSP for thread mode
+        tcb.state = TaskState::Ready;
+
+        rprintln!("[STACK] Task SP: 0x{:08x}, PC: 0x{:08x}", sp, hw_frame[6]);
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn task_return_trap() -> ! {
+        rprintln!("[FATAL] Task returned unexpectedly - this should never happen");
+
+        loop {
             unsafe {
-                gpio_enable_clock(GPIOA_BASE);
-                gpio_enable_clock(GPIOC_BASE);
-                gpio_set_output(self.led1.port_base, self.led1.pin);
-                gpio_set_output(self.led2.port_base, self.led2.pin);
-                gpio_set_input_pullup(self.btn.port_base, self.btn.pin);
-            }
-        }
-
-        fn spin_delay(&mut self, ms: u32) {
-            for _ in 0..ms {
-                for _ in 0..self.cycles_per_ms { nop(); }
-                self.time_ms = self.time_ms.wrapping_add(1);
-            }
-        }
-    }
-
-    impl Syscalls for BoardSyscalls {
-        fn gpio_write(&mut self, pin: GpioPin, high: bool) {
-            unsafe {
-                match pin {
-                    GpioPin::Led1 => gpio_write(self.led1.port_base, self.led1.pin, high),
-                    GpioPin::Led2 => gpio_write(self.led2.port_base, self.led2.pin, high),
+                core::ptr::write_volatile(ICSR, 1 << 28);
+                // Memory barrier
+                core::arch::asm!("dsb", "isb", options(nomem, nostack));
+                // Wait a bit before retriggering
+                for _ in 0..1000 {
+                    core::arch::asm!("nop", options(nomem, nostack));
                 }
             }
         }
-        fn gpio_toggle(&mut self, pin: GpioPin) {
-            unsafe {
-                match pin {
-                    GpioPin::Led1 => gpio_toggle(self.led1.port_base, self.led1.pin),
-                    GpioPin::Led2 => gpio_toggle(self.led2.port_base, self.led2.pin),
+    }
+
+    pub unsafe fn init_kernel_and_tasks() {
+        unsafe {
+
+            // Initialize kernel stack - MSP will continue to use this
+            let _kernel_stack_ptr = core::ptr::addr_of_mut!(KERNEL_STACK.0);
+
+            // MSP should already be pointing to a valid kernel stack
+            // We don't change MSP here - it stays as the kernel/interrupt stack
+
+
+            // Initialize Task 0
+            let task0_addr = task0_entry as usize;
+            rprintln!("[SCHED] Task 0 entry point: 0x{:08x}", task0_addr);
+            init_task_stack_and_tcb(&mut TASK_STACKS[0].0, task0_addr, &mut TCBS[0]);
+
+            // Memory barrier and small delay before next task
+            core::arch::asm!("dsb", "isb", options(nomem, nostack));
+            for _ in 0..1000 {
+                core::arch::asm!("nop", options(nomem, nostack));
+            }
+
+            // Initialize Task 1
+            let task1_addr = task1_entry as usize;
+            rprintln!("[SCHED] Task 1 entry point: 0x{:08x}", task1_addr);
+            init_task_stack_and_tcb(&mut TASK_STACKS[1].0, task1_addr, &mut TCBS[1]);
+
+            // Initialize Task 2
+            let task2_addr = task2_entry as usize;
+            rprintln!("[SCHED] Task 2 entry point: 0x{:08x}", task2_addr);
+            init_task_stack_and_tcb(&mut TASK_STACKS[2].0, task2_addr, &mut TCBS[2]);
+
+            CURR = 0;
+
+            rprintln!("[SCHED] All tasks initialized");
+        }
+    }
+
+    pub unsafe fn init_systick_1s() {
+        unsafe {
+            // Initialize BASEPRI to 0 (no masking)
+            core::arch::asm!("mov r0, #0", "msr basepri, r0", out("r0") _, options(nomem, nostack));
+
+            // Set up SysTick registers
+            let syst_csr = 0xE000_E010 as *mut u32;
+            let syst_rvr = 0xE000_E014 as *mut u32;
+            let syst_cvr = 0xE000_E018 as *mut u32;
+
+            // Configure SysTick: 1 second intervals
+            core::ptr::write_volatile(syst_rvr, 15999999);  // 1s at 16MHz
+            core::ptr::write_volatile(syst_cvr, 0);          // Clear current value
+            core::ptr::write_volatile(syst_csr, (1 << 2) | 1);  // Enable counting but no interrupt initially
+
+            rprintln!("[SYSTICK] Configured for 1 second intervals");
+
+            // Memory barrier
+            core::arch::asm!("dsb", "isb", options(nomem, nostack));
+        }
+    }
+
+    pub unsafe fn enable_systick_interrupt() {
+        unsafe {
+            let syst_csr = 0xE000_E010 as *mut u32;
+            // Enable both counting and interrupt
+            core::ptr::write_volatile(syst_csr, (1 << 2) | (1 << 1) | 1);
+            // Memory barrier
+            core::arch::asm!("dsb", "isb", options(nomem, nostack));
+        }
+    }
+
+    pub fn start() -> ! {
+        rprintln!("[SCHED] Starting...");
+
+        unsafe {
+            let mut scb = cortex_m::Peripherals::take().unwrap().SCB;
+            scb.set_priority(cortex_m::peripheral::scb::SystemHandler::PendSV, 255);
+            scb.set_priority(cortex_m::peripheral::scb::SystemHandler::SysTick, 128);
+            init_systick_1s();
+            enable_systick_interrupt();
+        }
+
+        // Kernel idle loop - Wait For Interrupt (CPU sleeps until interrupt)
+        loop {
+            cortex_m::asm::wfi();
+        }
+    }
+
+
+    static mut FIRST_SWITCH: bool = true;
+    static mut NEXT_TASK_PSP: u32 = 0;
+
+    /*
+    // Old PendSV - simple restart approach (disabled)
+    #[exception]
+    fn PendSV() {
+        unsafe {
+            cortex_m::peripheral::SCB::clear_pendsv();
+
+            if FIRST_SWITCH {
+                FIRST_SWITCH = false;
+                rprintln!("[PendSV] First switch to Task 0");
+
+                // Get Task 0's stack pointer - this points to control+lr+sw+hw context
+                // For first run, we need to skip to hardware context
+                let task0_sp = TCBS[0].sp;
+                let hw_context_sp = task0_sp + (2 + 10) * 4; // Skip control+lr + r2-r11
+
+                core::arch::asm!(
+                    // Set PSP to Task 0's hardware exception frame
+                    "msr psp, {psp}",
+
+                    // Switch to thread mode using PSP
+                    "mrs r1, control",
+                    "orr r1, r1, #2",         // Use PSP for thread mode
+                    "msr control, r1",
+                    "isb",
+
+                    // Return to thread mode - hardware will restore exception frame
+                    "mov lr, #0xFFFFFFFD",
+                    "bx lr",
+
+                    psp = in(reg) hw_context_sp,
+                    options(noreturn)
+                );
+            } else {
+                // Normal context switching
+                let current_task = CURR;
+                let next_task = (current_task + 1) % N_TASKS;
+
+                rprintln!("[PendSV] Switch: Task {} -> Task {}", current_task, next_task);
+
+                CURR = next_task;
+
+                // Always use initial stack for simplicity - tasks restart fresh ... [TODO]
+                let task_sp = TCBS[next_task].sp;
+                let hw_context_sp = task_sp + (2 + 10) * 4; // Skip to hardware context
+
+                core::arch::asm!(
+                    // Set PSP to next task's hardware exception frame
+                    "msr psp, {psp}",
+
+                    // Switch to thread mode using PSP
+                    "mrs r1, control",
+                    "orr r1, r1, #2",         // Use PSP for thread mode
+                    "msr control, r1",
+                    "isb",
+
+                    // Return to thread mode - hardware will restore exception frame
+                    "mov lr, #0xFFFFFFFD",
+                    "bx lr",
+
+                    psp = in(reg) hw_context_sp,
+                    options(noreturn)
+                );
+            }
+        }
+    }
+    */
+
+    // Context switching Rust helper functions - returns r4_ptr, sets PSP in global
+    extern "C" fn pend_sv_switch_rust() -> *mut u32 {
+        unsafe {
+            cortex_m::peripheral::SCB::clear_pendsv();
+
+            if FIRST_SWITCH {
+                FIRST_SWITCH = false;
+                // rprintln!("[🚀 START] Task 0");
+
+                // Mark task 0 as running
+                TCBS[0].state = TaskState::Running;
+
+                // Set PSP in global and return r4 pointer
+                NEXT_TASK_PSP = TCBS[0].sp;
+                return core::ptr::addr_of_mut!(TCBS[0].r4);
+            } else {
+                // Normal context switching
+                let current_task = CURR;
+                let next_task = (current_task + 1) % N_TASKS;
+
+                // rprintln!("[🔄 SWITCH] Task {} → Task {}", current_task, next_task);
+
+                // Update task states
+                TCBS[current_task].state = TaskState::Ready;
+                TCBS[next_task].state = TaskState::Running;
+
+                CURR = next_task;
+
+                // Set PSP in global and return r4 pointer
+                NEXT_TASK_PSP = TCBS[next_task].sp;
+                return core::ptr::addr_of_mut!(TCBS[next_task].r4);
+            }
+        }
+    }
+
+    extern "C" fn save_current_context_rust(psp: *mut u32, r4: u32, r5: u32, r6: u32, r7: u32, r8: u32, r9: u32, r10: u32, r11: u32) {
+        unsafe {
+            if CURR < N_TASKS {  // Safety check
+                let current_task = CURR;
+                // Save current PSP and software context to TCB
+                TCBS[current_task].sp = psp as u32;
+                TCBS[current_task].r4 = r4;
+                TCBS[current_task].r5 = r5;
+                TCBS[current_task].r6 = r6;
+                TCBS[current_task].r7 = r7;
+                TCBS[current_task].r8 = r8;
+                TCBS[current_task].r9 = r9;
+                TCBS[current_task].r10 = r10;
+                TCBS[current_task].r11 = r11;
+
+                // Show which task was running and a simple progress indicator
+                // match current_task {
+                //     0 => rprintln!("[TASK0] 🔵 Accumulator task was running"),
+                //     1 => rprintln!("[TASK1] 🟡 Fibonacci task was running"),
+                //     2 => rprintln!("[TASK2] 🟣 Sum task was running"),
+                //     _ => {}
+                // }
+            }
+        }
+    }
+
+    use core::arch::global_asm;
+
+    global_asm!(
+        r#"
+        .global PendSV
+        .type PendSV, %function
+    PendSV:
+        @ PendSV always runs in privileged mode using MSP (kernel stack)
+        @ This preserves kernel context automatically
+
+        mrs     r0, psp
+        cbz     r0, first_switch
+
+    normal_switch:
+        @ Normal task-to-task switch
+        @ Save current task's software context (r4-r11) to TCB
+        @ Pass PSP and all callee-saved registers to save function
+        push    {{lr}}
+        mov     r1, r4          @ r1 = r4
+        mov     r2, r5          @ r2 = r5
+        mov     r3, r6          @ r3 = r6
+        push    {{r7-r11}}      @ push r7-r11 onto stack for function call
+        bl      {save_context_fn}
+        add     sp, sp, #20     @ clean up stack (5 registers * 4 bytes)
+        pop     {{lr}}
+
+        @ Call scheduler to get next task's context pointer
+        push    {{lr}}
+        bl      {switch_fn}
+        @ r0 = r4_ptr
+        mov     r2, r0          @ Save r4_ptr in r2
+        pop     {{lr}}
+
+        @ Load PSP from global variable
+        ldr     r1, ={next_psp}
+        ldr     r1, [r1]
+
+        @ Load new task's context from r2 (r4 pointer)
+        ldmia   r2, {{r4-r11}}
+
+        @ Set PSP from r1
+        msr     psp, r1
+
+        @ Return to thread mode
+        bx      lr
+
+    first_switch:
+        @ Initial switch from kernel to first task
+        @ PSP is 0, so we're switching from MSP (kernel) to PSP (task)
+
+        @ Call scheduler to get first task's context
+        push    {{lr}}
+        bl      {switch_fn}
+        @ r0 = r4_ptr
+        mov     r2, r0          @ Save r4_ptr in r2
+        pop     {{lr}}
+
+        @ Load PSP from global variable
+        ldr     r1, ={next_psp}
+        ldr     r1, [r1]
+
+        @ Load task's software context from r2 (r4 pointer)
+        ldmia   r2, {{r4-r11}}
+
+        @ Set PSP from r1
+        msr     psp, r1
+
+        @ Switch to thread mode using PSP
+        mrs     r1, CONTROL
+        orr     r1, r1, #2     @ Use PSP for thread mode
+        msr     CONTROL, r1
+        isb                    @ Instruction barrier for CONTROL changes
+
+        @ Ensure BASEPRI is cleared for tasks
+        mov     r2, #0
+        msr     basepri, r2
+
+        @ Set return to thread mode with PSP (EXC_RETURN = 0xFFFFFFFD)
+        movw    lr, #0xFFFD
+        movt    lr, #0xFFFF
+        bx      lr
+    "#,
+        switch_fn = sym pend_sv_switch_rust,
+        save_context_fn = sym save_current_context_rust,
+        next_psp = sym NEXT_TASK_PSP
+    );
+
+
+
+    #[exception]
+    fn SysTick() {
+        // Trigger PendSV every 2 seconds
+        cortex_m::peripheral::SCB::set_pendsv();
+    }
+}
+
+
+// ───────────── TASKS ─────────────
+
+// Global task state variables for reporting
+static mut TASK0_COUNTER: u32 = 1000;
+static mut TASK0_ACCUMULATOR: u32 = 0;
+static mut TASK1_COUNTER: u32 = 2000;
+static mut TASK1_FIB_A: u32 = 0;
+static mut TASK1_FIB_B: u32 = 1;
+static mut TASK1_FIB_COUNT: u32 = 0;
+static mut TASK2_COUNTER: u32 = 3000;
+static mut TASK2_SUM: u32 = 0;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn task0_entry() -> ! {
+    rprintln!("[TASK0] Entry - context switching validation started!");
+
+    // Turn on LED using syscalls to indicate task is running
+    syscalls().gpio_write(GpioPin::Led1, true);
+
+    loop {
+        unsafe {
+            TASK0_COUNTER = TASK0_COUNTER.wrapping_add(1);
+            TASK0_ACCUMULATOR = TASK0_ACCUMULATOR.wrapping_add(TASK0_COUNTER * 7);
+
+            // Show progress with LED patterns (fast feedback)
+            if TASK0_COUNTER % 5000 == 0 {
+                // LED toggle to show task 0 is working
+                syscalls().gpio_toggle(GpioPin::Led1);
+            }
+
+            // Frequent output for quick feedback
+            if TASK0_COUNTER % 500 == 0 {
+                cortex_m::interrupt::disable();
+                let c = core::ptr::read_volatile(core::ptr::addr_of!(TASK0_COUNTER));
+                let a = core::ptr::read_volatile(core::ptr::addr_of!(TASK0_ACCUMULATOR));
+                rprintln!("[DEBUG] Task0 - Counter: {}, Accum: 0x{:08x}", c, a);
+                cortex_m::interrupt::enable();
+            }
+        }
+
+        // Simple delay
+        for _ in 0..1000 {
+            cortex_m::asm::nop();
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn task1_entry() -> ! {
+    rprintln!("[TASK1] Entry - fibonacci sequence calculator started!");
+
+    loop {
+        unsafe {
+            TASK1_COUNTER = TASK1_COUNTER.wrapping_add(1);
+
+            // Calculate fibonacci sequence every 100 iterations
+            if TASK1_COUNTER % 100 == 0 {
+                let fib_next = TASK1_FIB_A.wrapping_add(TASK1_FIB_B);
+                TASK1_FIB_A = TASK1_FIB_B;
+                TASK1_FIB_B = fib_next;
+                TASK1_FIB_COUNT = TASK1_FIB_COUNT.wrapping_add(1);
+
+                // Quick fibonacci milestones (every 5 calculations)
+                if TASK1_FIB_COUNT % 5 == 0 {
+                    cortex_m::interrupt::disable();
+                    let count = core::ptr::read_volatile(core::ptr::addr_of!(TASK1_FIB_COUNT));
+                    let fib = core::ptr::read_volatile(core::ptr::addr_of!(TASK1_FIB_B));
+                    rprintln!("[DEBUG] Task1 - Fib#{}: {}", count, fib);
+                    cortex_m::interrupt::enable();
                 }
             }
         }
-        fn sleep_ms(&mut self, ms: u32) { self.spin_delay(ms); }
-        fn now_ms(&self) -> u64 { self.time_ms }
-        fn user_button_pressed(&self) -> bool {
-            unsafe {
-                // B1 on Nucleo-F446RE (PC13): pull-up. Pressed => level LOW.
-                let high = gpio_read_input(self.btn.port_base, self.btn.pin);
-                !high
-            }
+
+        // Simple delay
+        for _ in 0..1000 {
+            cortex_m::asm::nop();
         }
     }
-
-    pub const GPIOA: u32 = GPIOA_BASE;
-    pub const GPIOC: u32 = GPIOC_BASE;
 }
 
-// --------------------------- main ---------------------------
-const CYCLES_PER_MS_ESTIMATE: u32 = 16_000; // HSI 16 MHz (tune if needed)
+#[unsafe(no_mangle)]
+pub extern "C" fn task2_entry() -> ! {
+    rprintln!("[TASK2] Entry - prime number finder started!");
 
-// --- Unpriviledged Thread + PSP 전환용 유저 스택 (8바이트 정렬) ---
-use core::ptr::addr_of_mut;
-const STACK_BYTES: usize = 2048;
-#[repr(align(8))]
-struct UserStack([u8; 2048]);
-static mut USER_STACK: UserStack = UserStack([0; STACK_BYTES]);  // size can be adjusted
+    loop {
+        unsafe {
+            TASK2_COUNTER = TASK2_COUNTER.wrapping_add(1);
+            TASK2_SUM = TASK2_SUM.wrapping_add(TASK2_COUNTER);
 
-// --- PSP 사용 + Unpriviledged Thread 모드 전환 ---
-unsafe fn switch_to_unpriv_psp() {
-    use cortex_m::register::psp;
+            // Frequent output for quick feedback
+            if TASK2_COUNTER % 500 == 0 {
+                cortex_m::interrupt::disable();
+                let c = core::ptr::read_volatile(core::ptr::addr_of!(TASK2_COUNTER));
+                let s = core::ptr::read_volatile(core::ptr::addr_of!(TASK2_SUM));
+                rprintln!("[DEBUG] Task2 - Counter: {}, Sum: {}", c, s);
+                cortex_m::interrupt::enable();
+            }
+        }
 
-    let base: *mut u8 = unsafe { addr_of_mut!(USER_STACK.0) as *mut u8 };
-
-    // PSP를 유저 스택 최상단으로 설정 (8바이트 정렬 보장)
-    let top_ptr = unsafe { base.add(STACK_BYTES) as u32 };
-
-    unsafe { psp::write(top_ptr); }
-
-    // CONTROL 레지스터: SPSEL=1(PSP), nPRIV=1(Unpriviledged)
-    unsafe {
-        core::arch::asm!(
-            "mrs r0, CONTROL",
-            "orr r0, r0, #2",   // SPSEL=1
-            "msr CONTROL, r0",
-            "isb",
-            "mrs r0, CONTROL",
-            "orr r0, r0, #1",   // nPRIV=1
-            "msr CONTROL, r0",
-            "isb",
-            out("r0") _,
-            options(nostack, preserves_flags)
-        );
+        // Simple delay
+        for _ in 0..1000 {
+            cortex_m::asm::nop();
+        }
     }
 }
+
+// ───────────── MAIN ENTRY ─────────────
+static mut BOARD: Option<board::BoardSyscalls> = None;
+static mut SYSCALL_CLIENT: Option<svc::Client> = None;
+static mut SYSCALLS_PTR: *mut svc::Client = core::ptr::null_mut();
 
 #[inline(always)]
-pub(crate) fn is_unpriv_thread() -> bool {
-    let mut control: u32;
+fn syscalls() -> &'static mut svc::Client {
     unsafe {
-        core::arch::asm!(
-            "mrs {0}, CONTROL",
-            out(reg) control,
-        );
+        if SYSCALLS_PTR.is_null() {
+            // Hang instead of using rprintln
+            loop {}
+        }
+        &mut *SYSCALLS_PTR
     }
-    control & 1 != 0    // 1이면 Unpriviledged Thread 모드
 }
+
+// LED debugging functions removed - using RTT instead
 
 #[entry]
 fn main() -> ! {
     rtt_init_print!();
-    rprintln!("[mini-os] booting (button-controlled switching)");
 
-    // Map both logical LEDs to PA5 for visibility; button is PC13.
-    let mut board = board::BoardSyscalls::new(
-        board::RawPin::new(board::GPIOA, 5),  // Led1 → PA5
-        board::RawPin::new(board::GPIOA, 5),  // Led2 → PA5
-        board::RawPin::new(board::GPIOC, 13), // Btn  → PC13
-        CYCLES_PER_MS_ESTIMATE,
-    );
+    // RTT 초기화 확인을 위한 지연
+    for _ in 0..100000 {
+        cortex_m::asm::nop();
+    }
 
-    unsafe { board.init(); }
-    rprintln!("GPIO ready: PA5 output, PC13 input-pullup");
+    rprintln!("[mini-os] Booting");
 
-    // SVC Handler에 커널 보드 포인터 등록
-    unsafe { svc::register_kernel_board(&mut board as *mut _); }
+    unsafe {
+        // ───── Initialize static BOARD instance ─────
+        BOARD = Some(board::BoardSyscalls::new(
+            board::RawPin::new(board::GPIOA, 5),
+            board::RawPin::new(board::GPIOC, 13),
+            CYCLES_PER_MS_ESTIMATE,
+        ));
 
-    // Syscalls 클라이언트 생성
-    let mut syscalls = unsafe { svc::Client::new(&mut board) };
-    
-    // Two apps: 0 = heartbeat, 1 = SOS
-    let mut app_beat = apps::HeartbeatApp::new(3);
-    let mut app_sos  = apps::LedSosApp::new();
-    let mut app_list: [&mut dyn os::App; 2] = [ &mut app_beat, &mut app_sos ];
+        // Extract raw pointer to BOARD
+        let board_option_ptr = core::ptr::addr_of_mut!(BOARD);
+        let board_ptr: *mut board::BoardSyscalls = (*board_option_ptr).as_mut().unwrap() as *mut _;
 
-    let mut kernel = os::Os::new(&mut app_list, &mut syscalls);
-    // Button not pressed => heartbeat; pressed => SOS
-    kernel.run(os::AppCall::SwitchOnButton { primary: 0, secondary: 1 })
+        // Call .init() via pointer deref
+        (*board_ptr).init();
+
+        // Register with SVC
+        svc::register_kernel_board(board_ptr);
+
+        // ───── Create syscall client instance and assign to global ─────
+        SYSCALL_CLIENT = Some(svc::Client::new(&mut *board_ptr));
+        let client_option_ptr = core::ptr::addr_of_mut!(SYSCALL_CLIENT);
+        SYSCALLS_PTR = (*client_option_ptr).as_mut().unwrap() as *mut _;
+    }
+
+    rprintln!("[MAIN] Board initialization complete");
+
+    rprintln!("[MAIN] Initializing OS...");
+    unsafe {
+        sched::init_kernel_and_tasks();
+    }
+
+    sched::start();
 }
