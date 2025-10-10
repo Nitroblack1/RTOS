@@ -9,6 +9,7 @@ use rtt_target::{rprintln, rtt_init_print};
 use stm32f4 as _; // Required for memory layout and vector table
 
 
+// for debug
 #[cortex_m_rt::exception]
 unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
     rprintln!("[FATAL] HardFault occurred at PC: 0x{:08x}", ef.pc());
@@ -26,6 +27,7 @@ unsafe fn MemoryManagement() -> ! {
     rprintln!("[FATAL] MemoryManagement fault occurred");
     loop {}
 }
+// for debug
 
 const CYCLES_PER_MS_ESTIMATE: u32 = 16_000;
 
