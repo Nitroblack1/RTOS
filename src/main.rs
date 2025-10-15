@@ -602,74 +602,6 @@ mod sched {
     static mut FIRST_SWITCH: bool = true;
     static mut NEXT_TASK_PSP: u32 = 0;
 
-    /*
-    // Old PendSV - simple restart approach (disabled)
-    #[exception]
-    fn PendSV() {
-        unsafe {
-            cortex_m::peripheral::SCB::clear_pendsv();
-
-            if FIRST_SWITCH {
-                FIRST_SWITCH = false;
-                rprintln!("[PendSV] First switch to Task 0");
-
-                // Get Task 0's stack pointer - this points to control+lr+sw+hw context
-                // For first run, we need to skip to hardware context
-                let task0_sp = TCBS[0].sp;
-                let hw_context_sp = task0_sp + (2 + 10) * 4; // Skip control+lr + r2-r11
-
-                core::arch::asm!(
-                    // Set PSP to Task 0's hardware exception frame
-                    "msr psp, {psp}",
-
-                    // Switch to thread mode using PSP
-                    "mrs r1, control",
-                    "orr r1, r1, #2",         // Use PSP for thread mode
-                    "msr control, r1",
-                    "isb",
-
-                    // Return to thread mode - hardware will restore exception frame
-                    "mov lr, #0xFFFFFFFD",
-                    "bx lr",
-
-                    psp = in(reg) hw_context_sp,
-                    options(noreturn)
-                );
-            } else {
-                // Normal context switching
-                let current_task = CURR;
-                let next_task = (current_task + 1) % N_TASKS;
-
-                rprintln!("[PendSV] Switch: Task {} -> Task {}", current_task, next_task);
-
-                CURR = next_task;
-
-                // Always use initial stack for simplicity - tasks restart fresh ... [TODO]
-                let task_sp = TCBS[next_task].sp;
-                let hw_context_sp = task_sp + (2 + 10) * 4; // Skip to hardware context
-
-                core::arch::asm!(
-                    // Set PSP to next task's hardware exception frame
-                    "msr psp, {psp}",
-
-                    // Switch to thread mode using PSP
-                    "mrs r1, control",
-                    "orr r1, r1, #2",         // Use PSP for thread mode
-                    "msr control, r1",
-                    "isb",
-
-                    // Return to thread mode - hardware will restore exception frame
-                    "mov lr, #0xFFFFFFFD",
-                    "bx lr",
-
-                    psp = in(reg) hw_context_sp,
-                    options(noreturn)
-                );
-            }
-        }
-    }
-    */
-
     // Context switching Rust helper functions - returns r4_ptr, sets PSP in global
     extern "C" fn pend_sv_switch_rust() -> *mut u32 {
         unsafe {
@@ -719,14 +651,6 @@ mod sched {
                 TCBS[current_task].r9 = r9;
                 TCBS[current_task].r10 = r10;
                 TCBS[current_task].r11 = r11;
-
-                // Show which task was running and a simple progress indicator
-                // match current_task {
-                //     0 => rprintln!("[TASK0] 🔵 Accumulator task was running"),
-                //     1 => rprintln!("[TASK1] 🟡 Fibonacci task was running"),
-                //     2 => rprintln!("[TASK2] 🟣 Sum task was running"),
-                //     _ => {}
-                // }
             }
         }
     }
