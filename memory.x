@@ -8,11 +8,11 @@ MEMORY
   CCRAM  (rwx) : ORIGIN = 0x10000000, LENGTH = 64K
 }
 
-/* 필요시 .ccram 섹션 매핑을 위해 아래를 링커 스크립트에 추가로 쓸 수 있음
+/* App metadata and memory protection sections */
 SECTIONS
 {
+  /* CCM RAM section for high-performance buffers */
   .ccram (NOLOAD) : {
     *(.ccram .ccram.*);
   } > CCRAM
 }
-*/

@@ -9,17 +9,5 @@ cortex-m-rt = "0.7.5"
 panic-halt = "1.0.0"
 rtt-target = "0.6.1"
 stm32f4 = { version = "0.15.0", features = ["stm32f446"] }
-
-# [profile.dev]
-# opt-level = 2
-# debug = true
-# codegen-units = 1
-# lto = false
-# panic = "abort"
-
-# [profile.release]
-# opt-level = 3
-# debug = true
-# codegen-units = 1
-# lto = true
-# panic = "abort"
+app-macros = { path = "app-macros" }
+paste = "1.0"

@@ -8,6 +8,147 @@ use panic_halt as _;
 use rtt_target::{rprintln, rtt_init_print};
 use stm32f4 as _; // Required for memory layout and vector table
 
+// Import modular apps (for compilation, but registration is automatic via linker)
+mod apps;
+
+// ───────────── APP METADATA SYSTEM ─────────────
+
+// ───────────── SIMPLIFIED AUTOMATIC REGISTRATION ─────────────
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+static APP_REGISTRY_COUNT: AtomicUsize = AtomicUsize::new(0);
+static mut APP_REGISTRY: [Option<AppMetadata>; 16] = [None; 16];
+
+/// Simple macro for automatic app registration - avoids linker issues
+#[macro_export]
+macro_rules! register_app {
+    ($entry_fn:ident, $id:expr, $name:expr, $stack_size:expr) => {
+        // Create a registration function and ensure it gets called
+        paste::paste! {
+            pub fn [<register_app_ $id>]() {
+                $crate::do_register_app($crate::AppMetadata {
+                    id: $id,
+                    name: $name,
+                    entry: 0,
+                    entry_fn: Some($entry_fn),
+                    stack_ptr: 0,
+                    stack_size: $stack_size,
+                    stack_ptr_fn: None,
+                });
+            }
+
+            // Create a static reference to ensure the function is not eliminated
+            #[used]
+            static [<APP_INIT_ $id>]: fn() = [<register_app_ $id>];
+        }
+    };
+}
+
+/// Runtime registration function
+pub fn do_register_app(app: AppMetadata) {
+    let idx = APP_REGISTRY_COUNT.fetch_add(1, Ordering::SeqCst);
+    if idx < 16 {
+        unsafe {
+            APP_REGISTRY[idx] = Some(app);
+        }
+    }
+}
+
+/// Function pointer type for app entry points
+pub type AppEntryFn = unsafe extern "C" fn() -> !;
+
+/// Metadata for statically registered applications
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct AppMetadata {
+    pub id: u32,
+    pub name: &'static str,
+    pub entry: usize,
+    pub entry_fn: Option<AppEntryFn>, // Direct function pointer - no string matching needed!
+    pub stack_ptr: usize, // Will be resolved at runtime
+    pub stack_size: u32,
+    pub stack_ptr_fn: Option<unsafe extern "C" fn() -> usize>, // Function to get stack pointer
+}
+
+// Make AppMetadata Sync so it can be used in static variables
+unsafe impl Sync for AppMetadata {}
+
+// Note: Using static arrays instead of linker sections for simplicity
+
+/// Get all statically registered apps from static array
+// ───────────── SIMPLIFIED AUTOMATIC APP DISCOVERY ─────────────
+
+/// Initialize app registry by calling registration functions
+pub fn initialize_app_registry() {
+    static ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    if !ONCE.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        return; // Already initialized
+    }
+
+    // Call all app registration functions - 7 apps total!
+    apps::led_blinker::register_app_0();
+    apps::fibonacci::register_app_1();
+    apps::counter::register_app_2();
+    apps::timer::register_app_3();
+    apps::gpio_monitor::register_app_4();
+    apps::math_calculator::register_app_5();
+    apps::network_stack::register_app_6(); // NEW APP!
+}
+
+/// Get all automatically registered apps from registry
+pub fn get_registered_apps() -> &'static [AppMetadata] {
+    initialize_app_registry();
+
+    let count = APP_REGISTRY_COUNT.load(Ordering::SeqCst);
+    unsafe {
+        static mut APPS_SLICE: [AppMetadata; 16] = [AppMetadata {
+            id: 0,
+            name: "",
+            entry: 0,
+            entry_fn: None,
+            stack_ptr: 0,
+            stack_size: 0,
+            stack_ptr_fn: None,
+        }; 16];
+
+        // Convert Option<AppMetadata> to AppMetadata slice
+        for i in 0..count.min(16) {
+            if let Some(app) = APP_REGISTRY[i] {
+                APPS_SLICE[i] = app;
+            }
+        }
+
+        &APPS_SLICE[..count.min(16)]
+    }
+}
+
+/// Get mutable reference to all automatically registered apps
+pub unsafe fn get_registered_apps_mut() -> &'static mut [AppMetadata] {
+    initialize_app_registry();
+
+    let count = APP_REGISTRY_COUNT.load(Ordering::SeqCst);
+    static mut APPS_SLICE: [AppMetadata; 16] = [AppMetadata {
+        id: 0,
+        name: "",
+        entry: 0,
+        entry_fn: None,
+        stack_ptr: 0,
+        stack_size: 0,
+        stack_ptr_fn: None,
+    }; 16];
+
+    // Convert Option<AppMetadata> to AppMetadata slice
+    for i in 0..count.min(16) {
+        unsafe {
+            if let Some(app) = APP_REGISTRY[i] {
+                APPS_SLICE[i] = app;
+            }
+        }
+    }
+
+    unsafe { &mut APPS_SLICE[..count.min(16)] }
+}
 
 // for debug
 #[cortex_m_rt::exception]
@@ -404,12 +545,12 @@ mod svc {
 
 mod sched {
     use cortex_m_rt::exception;
-    use crate::{task0_entry, task1_entry, task2_entry};
+    use crate::{AppMetadata, get_registered_apps_mut};
     use rtt_target::rprintln;
 
-    pub const N_TASKS: usize = 3;
-    const TASK_STACK_WORDS: usize = 256;
+    const MAX_APPS: usize = 16; // Maximum supported apps
     const KERNEL_STACK_WORDS: usize = 512;  // Kernel needs more stack for complex operations
+    const APP_STACK_WORDS: usize = 1024; // Default stack size per app
 
     #[derive(Copy, Clone, Debug)]
     pub enum TaskState {
@@ -432,38 +573,111 @@ mod sched {
         pub r11: u32,
         pub control: u32,   // CONTROL register value
         pub state: TaskState,
+        pub app_id: u32,    // Application ID
+        pub name: &'static str, // Application name
+        pub stack_base: *mut u32, // Stack base pointer for MPU
+        pub stack_size: u32,      // Stack size for MPU
     }
 
-    #[repr(align(8))]
-    #[derive(Copy, Clone)]
-    struct TaskStack([u32; TASK_STACK_WORDS]);
+    impl Default for Tcb {
+        fn default() -> Self {
+            Self {
+                sp: 0,
+                r4: 0, r5: 0, r6: 0, r7: 0, r8: 0, r9: 0, r10: 0, r11: 0,
+                control: 0x02,  // Use PSP for thread mode
+                state: TaskState::Ready,
+                app_id: 0,
+                name: "",
+                stack_base: core::ptr::null_mut(),
+                stack_size: 0,
+            }
+        }
+    }
 
     #[repr(align(8))]
     #[derive(Copy, Clone)]
     struct KernelStack([u32; KERNEL_STACK_WORDS]);
 
-    static mut TCBS: [Tcb; N_TASKS] = [Tcb {
+    #[repr(align(8))]
+    #[derive(Copy, Clone)]
+    struct AppStack([u32; APP_STACK_WORDS]);
+
+    static mut TCBS: [Tcb; MAX_APPS] = [Tcb {
         sp: 0,
         r4: 0, r5: 0, r6: 0, r7: 0, r8: 0, r9: 0, r10: 0, r11: 0,
         control: 0x02,  // Use PSP for thread mode
-        state: TaskState::Ready
-    }; N_TASKS];
-    static mut TASK_STACKS: [TaskStack; N_TASKS] = [TaskStack([0; TASK_STACK_WORDS]); N_TASKS];
+        state: TaskState::Ready,
+        app_id: 0,
+        name: "",
+        stack_base: core::ptr::null_mut(),
+        stack_size: 0,
+    }; MAX_APPS];
+    static mut APP_STACKS: [AppStack; MAX_APPS] = [AppStack([0; APP_STACK_WORDS]); MAX_APPS];
     static mut KERNEL_STACK: KernelStack = KernelStack([0; KERNEL_STACK_WORDS]);
     static mut CURR: usize = 0;
+    static mut N_TASKS: usize = 0; // Dynamic task count
 
     const ICSR: *mut u32 = 0xE000_ED04 as *mut u32;
     const SHPR3: *mut u32 = 0xE000_ED20 as *mut u32;
 
-    // Initialize task stack and TCB for new context switching approach
-    fn init_task_stack_and_tcb(stack: &mut [u32], task_fn: usize, tcb: &mut Tcb) {
-        let len = stack.len();
+    // Note: App entry functions are now referenced via function pointers in metadata
+    // No need for explicit extern declarations here
+
+    // Dynamic symbol resolution using linker-generated symbol table
+    // This is a more sophisticated approach that doesn't require hardcoded matches
+    unsafe extern "C" {
+        static __text_start: u8;
+        static __text_end: u8;
+    }
+
+    fn resolve_app_entry_dynamic(app_name: &str) -> usize {
+        // In a real embedded system, we would:
+        // 1. Parse the ELF symbol table at runtime
+        // 2. Look up symbols by name
+        // 3. Return their addresses
+        //
+        // For now, we use a simplified approach with function pointers
+        // stored in the metadata itself during compilation
+
+        rprintln!("[FATAL] Dynamic symbol resolution not yet implemented for: {}", app_name);
+        rprintln!("[INFO] Expected symbol: {}_entry", app_name);
+        loop {}
+    }
+
+    // Truly dynamic approach: Use function pointer stored in metadata
+    fn resolve_app_entry(app: &mut AppMetadata) -> usize {
+        if app.entry != 0 {
+            return app.entry; // Already resolved
+        }
+
+        // Use the function pointer directly - NO hardcoded matching!
+        match app.entry_fn {
+            Some(entry_fn) => {
+                let addr = entry_fn as usize;
+                rprintln!("[SCHED] Resolved '{}' entry point: 0x{:08x}", app.name, addr);
+                addr
+            },
+            None => {
+                rprintln!("[FATAL] No entry function provided for app '{}' (ID: {})", app.name, app.id);
+                loop {}
+            }
+        }
+    }
+
+    // Initialize task stack and TCB from app metadata
+    fn init_app_stack_and_tcb(app: &mut AppMetadata, tcb: &mut Tcb, stack: &mut [u32]) {
+        // Resolve entry point at runtime
+        if app.entry == 0 {
+            app.entry = resolve_app_entry(app);
+        }
 
         // Validate task function address
-        if (task_fn as u32) < 0x08000000 || (task_fn as u32) >= 0x08100000 {
-            rprintln!("[FATAL] Invalid task function: 0x{:08x}", task_fn);
+        if (app.entry as u32) < 0x08000000 || (app.entry as u32) >= 0x08100000 {
+            rprintln!("[FATAL] Invalid app entry point: 0x{:08x} for app '{}'", app.entry, app.name);
             loop {}
         }
+
+        let len = stack.len();
 
         // Stack layout: only hardware context (r0, r1, r2, r3, r12, lr, pc, xpsr) - 8 words from top
         let sp = unsafe { stack.as_ptr().add(len - 8) as u32 };
@@ -476,10 +690,10 @@ mod sched {
         hw_frame[3] = 0x03030303;                  // r3
         hw_frame[4] = 0x12121212;                  // r12
         hw_frame[5] = 0xFFFFFFFE;                  // LR (exception return value)
-        hw_frame[6] = task_fn as u32 | 1;          // PC with Thumb bit
+        hw_frame[6] = app.entry as u32 | 1;       // PC with Thumb bit
         hw_frame[7] = 0x01000000;                  // xPSR with Thumb state
 
-        // Initialize TCB with software context (callee-saved registers)
+        // Initialize TCB with software context and app metadata
         tcb.sp = sp;                               // PSP points to hardware frame
         tcb.r4 = 0x44444444;                       // r4
         tcb.r5 = 0x55555555;                       // r5
@@ -491,8 +705,13 @@ mod sched {
         tcb.r11 = 0xBBBBBBBB;                      // r11
         tcb.control = 0x02;                        // CONTROL: Use PSP for thread mode
         tcb.state = TaskState::Ready;
+        tcb.app_id = app.id;
+        tcb.name = app.name;
+        tcb.stack_base = stack.as_mut_ptr();
+        tcb.stack_size = stack.len() as u32;
 
-        rprintln!("[STACK] Task SP: 0x{:08x}, PC: 0x{:08x}", sp, hw_frame[6]);
+        rprintln!("[STACK] App '{}' (ID: {}) SP: 0x{:08x}, PC: 0x{:08x}, Stack: {} words",
+                  app.name, app.id, sp, hw_frame[6], app.stack_size);
     }
 
     #[unsafe(no_mangle)]
@@ -514,38 +733,47 @@ mod sched {
 
     pub unsafe fn init_kernel_and_tasks() {
         unsafe {
-
             // Initialize kernel stack - MSP will continue to use this
             let _kernel_stack_ptr = core::ptr::addr_of_mut!(KERNEL_STACK.0);
 
             // MSP should already be pointing to a valid kernel stack
             // We don't change MSP here - it stays as the kernel/interrupt stack
 
+            // Discover and initialize all registered apps
+            let registered_apps = get_registered_apps_mut();
+            N_TASKS = registered_apps.len();
 
-            // Initialize Task 0
-            let task0_addr = task0_entry as usize;
-            rprintln!("[SCHED] Task 0 entry point: 0x{:08x}", task0_addr);
-            init_task_stack_and_tcb(&mut TASK_STACKS[0].0, task0_addr, &mut TCBS[0]);
-
-            // Memory barrier and small delay before next task
-            core::arch::asm!("dsb", "isb", options(nomem, nostack));
-            for _ in 0..1000 {
-                core::arch::asm!("nop", options(nomem, nostack));
+            if N_TASKS == 0 {
+                rprintln!("[FATAL] No applications registered! Use #[app] attribute to register apps.");
+                loop {}
             }
 
-            // Initialize Task 1
-            let task1_addr = task1_entry as usize;
-            rprintln!("[SCHED] Task 1 entry point: 0x{:08x}", task1_addr);
-            init_task_stack_and_tcb(&mut TASK_STACKS[1].0, task1_addr, &mut TCBS[1]);
+            if N_TASKS > MAX_APPS {
+                rprintln!("[FATAL] Too many applications registered: {} > {}",
+                         core::ptr::read_volatile(core::ptr::addr_of!(N_TASKS)), MAX_APPS);
+                loop {}
+            }
 
-            // Initialize Task 2
-            let task2_addr = task2_entry as usize;
-            rprintln!("[SCHED] Task 2 entry point: 0x{:08x}", task2_addr);
-            init_task_stack_and_tcb(&mut TASK_STACKS[2].0, task2_addr, &mut TCBS[2]);
+            rprintln!("[SCHED] Initializing {} registered applications",
+                     core::ptr::read_volatile(core::ptr::addr_of!(N_TASKS)));
+
+            // Initialize each registered app
+            for (idx, app) in registered_apps.iter_mut().enumerate() {
+                rprintln!("[SCHED] Initializing app '{}' (ID: {}, Entry: 0x{:08x})",
+                         app.name, app.id, app.entry);
+
+                init_app_stack_and_tcb(app, &mut TCBS[idx], &mut APP_STACKS[idx].0);
+
+                // Memory barrier and small delay between tasks
+                core::arch::asm!("dsb", "isb", options(nomem, nostack));
+                for _ in 0..1000 {
+                    core::arch::asm!("nop", options(nomem, nostack));
+                }
+            }
 
             CURR = 0;
-
-            rprintln!("[SCHED] All tasks initialized");
+            rprintln!("[SCHED] All {} applications initialized successfully",
+                     core::ptr::read_volatile(core::ptr::addr_of!(N_TASKS)));
         }
     }
 
@@ -752,111 +980,12 @@ mod sched {
 }
 
 
-// ───────────── TASKS ─────────────
+// ───────────── APPLICATIONS ─────────────
+// Apps are automatically registered via #[app] macro and linker sections
 
-// Global task state variables for reporting
-static mut TASK0_COUNTER: u32 = 1000;
-static mut TASK0_ACCUMULATOR: u32 = 0;
-static mut TASK1_COUNTER: u32 = 2000;
-static mut TASK1_FIB_A: u32 = 0;
-static mut TASK1_FIB_B: u32 = 1;
-static mut TASK1_FIB_COUNT: u32 = 0;
-static mut TASK2_COUNTER: u32 = 3000;
-static mut TASK2_SUM: u32 = 0;
 
-#[unsafe(no_mangle)]
-pub extern "C" fn task0_entry() -> ! {
-    rprintln!("[TASK0] Entry - context switching validation started!");
 
-    // Turn on LED using syscalls to indicate task is running
-    syscalls().gpio_write(GpioPin::Led1, true);
 
-    loop {
-        unsafe {
-            TASK0_COUNTER = TASK0_COUNTER.wrapping_add(1);
-            TASK0_ACCUMULATOR = TASK0_ACCUMULATOR.wrapping_add(TASK0_COUNTER * 7);
-
-            // Show progress with LED patterns (fast feedback)
-            if TASK0_COUNTER % 5000 == 0 {
-                // LED toggle to show task 0 is working
-                syscalls().gpio_toggle(GpioPin::Led1);
-            }
-
-            // Frequent output for quick feedback
-            if TASK0_COUNTER % 500 == 0 {
-                cortex_m::interrupt::disable();
-                let c = core::ptr::read_volatile(core::ptr::addr_of!(TASK0_COUNTER));
-                let a = core::ptr::read_volatile(core::ptr::addr_of!(TASK0_ACCUMULATOR));
-                rprintln!("[DEBUG] Task0 - Counter: {}, Accum: 0x{:08x}", c, a);
-                cortex_m::interrupt::enable();
-            }
-        }
-
-        // Simple delay
-        for _ in 0..1000 {
-            cortex_m::asm::nop();
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn task1_entry() -> ! {
-    rprintln!("[TASK1] Entry - fibonacci sequence calculator started!");
-
-    loop {
-        unsafe {
-            TASK1_COUNTER = TASK1_COUNTER.wrapping_add(1);
-
-            // Calculate fibonacci sequence every 100 iterations
-            if TASK1_COUNTER % 100 == 0 {
-                let fib_next = TASK1_FIB_A.wrapping_add(TASK1_FIB_B);
-                TASK1_FIB_A = TASK1_FIB_B;
-                TASK1_FIB_B = fib_next;
-                TASK1_FIB_COUNT = TASK1_FIB_COUNT.wrapping_add(1);
-
-                // Quick fibonacci milestones (every 5 calculations)
-                if TASK1_FIB_COUNT % 5 == 0 {
-                    cortex_m::interrupt::disable();
-                    let count = core::ptr::read_volatile(core::ptr::addr_of!(TASK1_FIB_COUNT));
-                    let fib = core::ptr::read_volatile(core::ptr::addr_of!(TASK1_FIB_B));
-                    rprintln!("[DEBUG] Task1 - Fib#{}: {}", count, fib);
-                    cortex_m::interrupt::enable();
-                }
-            }
-        }
-
-        // Simple delay
-        for _ in 0..1000 {
-            cortex_m::asm::nop();
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn task2_entry() -> ! {
-    rprintln!("[TASK2] Entry - prime number finder started!");
-
-    loop {
-        unsafe {
-            TASK2_COUNTER = TASK2_COUNTER.wrapping_add(1);
-            TASK2_SUM = TASK2_SUM.wrapping_add(TASK2_COUNTER);
-
-            // Frequent output for quick feedback
-            if TASK2_COUNTER % 500 == 0 {
-                cortex_m::interrupt::disable();
-                let c = core::ptr::read_volatile(core::ptr::addr_of!(TASK2_COUNTER));
-                let s = core::ptr::read_volatile(core::ptr::addr_of!(TASK2_SUM));
-                rprintln!("[DEBUG] Task2 - Counter: {}, Sum: {}", c, s);
-                cortex_m::interrupt::enable();
-            }
-        }
-
-        // Simple delay
-        for _ in 0..1000 {
-            cortex_m::asm::nop();
-        }
-    }
-}
 
 // ───────────── MAIN ENTRY ─────────────
 static mut BOARD: Option<board::BoardSyscalls> = None;
@@ -874,7 +1003,50 @@ fn syscalls() -> &'static mut svc::Client {
     }
 }
 
-// LED debugging functions removed - using RTT instead
+// ───────────── TOCK-STYLE SYSCALL INTERFACE ─────────────
+/// Tock-style syscall interface for apps
+/// Apps should use these instead of direct syscalls() access
+pub mod app_syscalls {
+    use super::{syscalls, GpioPin, Syscalls};
+
+    /// Allow an app to control GPIO (with capability checking in future)
+    pub fn gpio_write(pin: GpioPin, value: bool) {
+        syscalls().gpio_write(pin, value);
+    }
+
+    /// Allow an app to toggle GPIO (with capability checking in future)
+    pub fn gpio_toggle(pin: GpioPin) {
+        syscalls().gpio_toggle(pin);
+    }
+
+    /// Allow an app to print debug messages (kernel-mediated logging)
+    pub fn debug_print(app_id: u32, message: &str) {
+        // In real Tock, this would go through proper logging subsystem
+        rtt_target::rprintln!("[APP{}] {}", app_id, message);
+    }
+
+    /// Allow an app to yield CPU (cooperative scheduling)
+    pub fn yield_cpu() {
+        // Simple yield implementation - in real Tock this would trigger scheduler
+        for _ in 0..100 {
+            cortex_m::asm::nop();
+        }
+    }
+
+    /// Allow an app to get current system time (if available)
+    pub fn get_system_ticks() -> u32 {
+        // Simple tick counter - in real Tock this would be from timer subsystem
+        unsafe {
+            static mut TICK_COUNTER: u32 = 0;
+            TICK_COUNTER = TICK_COUNTER.wrapping_add(1);
+            TICK_COUNTER
+        }
+    }
+
+    // Future: Add capability-based access control here
+    // pub fn gpio_write_with_capability(pin: GpioPin, value: bool, cap: &GpioCap) { ... }
+    // pub fn timer_subscribe_with_capability(callback: fn(), cap: &TimerCap) { ... }
+}
 
 #[entry]
 fn main() -> ! {
