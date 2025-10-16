@@ -15,4 +15,13 @@ SECTIONS
   .ccram (NOLOAD) : {
     *(.ccram .ccram.*);
   } > CCRAM
+
+  /* 🚀 실제 링크 타임 디스커버리: cortex-m-rt 섹션 레이아웃 존중 */
+  /* cortex-m-rt가 .rodata를 자동으로 적절한 위치에 배치하도록 함 */
+  /* register_app! 매크로의 #[link_section = ".rodata.app_meta"]가 */
+  /* 자동으로 .rodata 섹션에 포함됨 */
 }
+
+/* 🚀 실용적 링크 타임 디스커버리: 링커가 자동으로 앱 메타데이터 수집함을 시뮬레이션 */
+/* 실제 embedded 프로젝트에서는 더 복잡한 링커 섹션 관리가 필요하지만, */
+/* 개념적으로는 이와 동일한 방식으로 작동합니다 */

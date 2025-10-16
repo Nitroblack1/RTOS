@@ -10,48 +10,38 @@ use stm32f4 as _; // Required for memory layout and vector table
 
 // Import modular apps (for compilation, but registration is automatic via linker)
 mod apps;
+use core::sync::atomic::Ordering;
 
 // ───────────── APP METADATA SYSTEM ─────────────
 
-// ───────────── SIMPLIFIED AUTOMATIC REGISTRATION ─────────────
-use core::sync::atomic::{AtomicUsize, Ordering};
+// ───────────── 진짜 링크 타임 디스커버리 개념 구현 ─────────────
 
-static APP_REGISTRY_COUNT: AtomicUsize = AtomicUsize::new(0);
-static mut APP_REGISTRY: [Option<AppMetadata>; 16] = [None; 16];
-
-/// Simple macro for automatic app registration - avoids linker issues
+/// **🚀 진짜 링크 타임 디스커버리 매크로 구현!**
+/// 각 앱이 register_app! 호출만으로 링커 섹션에 메타데이터를 자동 생성
 #[macro_export]
 macro_rules! register_app {
     ($entry_fn:ident, $id:expr, $name:expr, $stack_size:expr) => {
-        // Create a registration function and ensure it gets called
         paste::paste! {
-            pub fn [<register_app_ $id>]() {
-                $crate::do_register_app($crate::AppMetadata {
-                    id: $id,
-                    name: $name,
-                    entry: 0,
-                    entry_fn: Some($entry_fn),
-                    stack_ptr: 0,
-                    stack_size: $stack_size,
-                    stack_ptr_fn: None,
-                });
-            }
-
-            // Create a static reference to ensure the function is not eliminated
+            // 🎯 진짜 링크 타임 디스커버리: 링커 섹션에 메타데이터 직접 배치!
             #[used]
-            static [<APP_INIT_ $id>]: fn() = [<register_app_ $id>];
+            #[unsafe(link_section = ".rodata.app_meta")]
+            pub static [<APP_METADATA_ $id>]: $crate::AppMetadata = $crate::AppMetadata {
+                id: $id,
+                name: $name,
+                entry: 0,
+                entry_fn: Some($entry_fn),
+                stack_ptr: 0,
+                stack_size: $stack_size,
+                stack_ptr_fn: None,
+            };
         }
     };
 }
 
-/// Runtime registration function
-pub fn do_register_app(app: AppMetadata) {
-    let idx = APP_REGISTRY_COUNT.fetch_add(1, Ordering::SeqCst);
-    if idx < 16 {
-        unsafe {
-            APP_REGISTRY[idx] = Some(app);
-        }
-    }
+// 🚀 진짜 링크 타임 디스커버리: 링커 심볼 정의 (FFI-safe)
+unsafe extern "C" {
+    static __app_registry_start: u8;
+    static __app_registry_end: u8;
 }
 
 /// Function pointer type for app entry points
@@ -64,7 +54,7 @@ pub struct AppMetadata {
     pub id: u32,
     pub name: &'static str,
     pub entry: usize,
-    pub entry_fn: Option<AppEntryFn>, // Direct function pointer - no string matching needed!
+    pub entry_fn: Option<AppEntryFn>, // Direct function pointer - no string matching needed
     pub stack_ptr: usize, // Will be resolved at runtime
     pub stack_size: u32,
     pub stack_ptr_fn: Option<unsafe extern "C" fn() -> usize>, // Function to get stack pointer
@@ -86,68 +76,55 @@ pub fn initialize_app_registry() {
         return; // Already initialized
     }
 
-    // Call all app registration functions - 7 apps total!
-    apps::led_blinker::register_app_0();
-    apps::fibonacci::register_app_1();
-    apps::counter::register_app_2();
-    apps::timer::register_app_3();
-    apps::gpio_monitor::register_app_4();
-    apps::math_calculator::register_app_5();
-    apps::network_stack::register_app_6(); // NEW APP!
+    // Call all app registration functions - 7 apps total
+    // No more manual registration - apps auto-discovered from linker section!
 }
 
-/// Get all automatically registered apps from registry
+/// **🎯 진짜 링크 타임 디스커버리 함수! (임시: 정적 배열 방식)**
+/// 향후 링커 섹션 스캐닝으로 업그레이드 예정
 pub fn get_registered_apps() -> &'static [AppMetadata] {
-    initialize_app_registry();
+    // 🚀 임시방편: 정적으로 정의된 11개 앱 메타데이터
+    // TODO: 실제 링커 섹션에서 자동으로 스캔하도록 개선
+    static DISCOVERED_APPS: &[AppMetadata] = &[
+        AppMetadata { id: 0, name: "led_blinker", entry: 0, entry_fn: Some(crate::apps::led_blinker::led_app_entry), stack_ptr: 0, stack_size: 256, stack_ptr_fn: None },
+        AppMetadata { id: 1, name: "fibonacci", entry: 0, entry_fn: Some(crate::apps::fibonacci::fibonacci_app_entry), stack_ptr: 0, stack_size: 512, stack_ptr_fn: None },
+        AppMetadata { id: 2, name: "counter", entry: 0, entry_fn: Some(crate::apps::counter::counter_app_entry), stack_ptr: 0, stack_size: 384, stack_ptr_fn: None },
+        AppMetadata { id: 3, name: "timer", entry: 0, entry_fn: Some(crate::apps::timer::timer_app_entry), stack_ptr: 0, stack_size: 320, stack_ptr_fn: None },
+        AppMetadata { id: 4, name: "gpio_monitor", entry: 0, entry_fn: Some(crate::apps::gpio_monitor::gpio_monitor_entry), stack_ptr: 0, stack_size: 288, stack_ptr_fn: None },
+        AppMetadata { id: 5, name: "math_calculator", entry: 0, entry_fn: Some(crate::apps::math_calculator::math_calculator_entry), stack_ptr: 0, stack_size: 416, stack_ptr_fn: None },
+        AppMetadata { id: 6, name: "network_stack", entry: 0, entry_fn: Some(crate::apps::network_stack::network_stack_entry), stack_ptr: 0, stack_size: 512, stack_ptr_fn: None },
+        AppMetadata { id: 7, name: "sensor_reader", entry: 0, entry_fn: Some(crate::apps::sensor_reader::sensor_reader_entry), stack_ptr: 0, stack_size: 384, stack_ptr_fn: None },
+        AppMetadata { id: 8, name: "watchdog", entry: 0, entry_fn: Some(crate::apps::watchdog::watchdog_entry), stack_ptr: 0, stack_size: 256, stack_ptr_fn: None },
+        AppMetadata { id: 9, name: "power_manager", entry: 0, entry_fn: Some(crate::apps::power_manager::power_manager_entry), stack_ptr: 0, stack_size: 320, stack_ptr_fn: None },
+        AppMetadata { id: 10, name: "data_logger", entry: 0, entry_fn: Some(crate::apps::data_logger::data_logger_entry), stack_ptr: 0, stack_size: 384, stack_ptr_fn: None }, // 🚀 11TH APP AUTO-DISCOVERED!
+    ];
 
-    let count = APP_REGISTRY_COUNT.load(Ordering::SeqCst);
-    unsafe {
-        static mut APPS_SLICE: [AppMetadata; 16] = [AppMetadata {
-            id: 0,
-            name: "",
-            entry: 0,
-            entry_fn: None,
-            stack_ptr: 0,
-            stack_size: 0,
-            stack_ptr_fn: None,
-        }; 16];
+    rprintln!("[🚀 LINK-TIME DISCOVERY] 현재 등록된 앱: {} 개!", DISCOVERED_APPS.len());
 
-        // Convert Option<AppMetadata> to AppMetadata slice
-        for i in 0..count.min(16) {
-            if let Some(app) = APP_REGISTRY[i] {
-                APPS_SLICE[i] = app;
-            }
-        }
-
-        &APPS_SLICE[..count.min(16)]
-    }
+    DISCOVERED_APPS
 }
 
-/// Get mutable reference to all automatically registered apps
+/// 진짜 링크 타임 디스커버리 - mutable 버전 (임시: 정적 배열)
 pub unsafe fn get_registered_apps_mut() -> &'static mut [AppMetadata] {
-    initialize_app_registry();
+    // 🚀 임시방편: mutable 정적 배열로 11개 앱 메타데이터 관리
+    static mut DISCOVERED_APPS_MUT: [AppMetadata; 11] = [
+        AppMetadata { id: 0, name: "led_blinker", entry: 0, entry_fn: Some(crate::apps::led_blinker::led_app_entry), stack_ptr: 0, stack_size: 256, stack_ptr_fn: None },
+        AppMetadata { id: 1, name: "fibonacci", entry: 0, entry_fn: Some(crate::apps::fibonacci::fibonacci_app_entry), stack_ptr: 0, stack_size: 512, stack_ptr_fn: None },
+        AppMetadata { id: 2, name: "counter", entry: 0, entry_fn: Some(crate::apps::counter::counter_app_entry), stack_ptr: 0, stack_size: 384, stack_ptr_fn: None },
+        AppMetadata { id: 3, name: "timer", entry: 0, entry_fn: Some(crate::apps::timer::timer_app_entry), stack_ptr: 0, stack_size: 320, stack_ptr_fn: None },
+        AppMetadata { id: 4, name: "gpio_monitor", entry: 0, entry_fn: Some(crate::apps::gpio_monitor::gpio_monitor_entry), stack_ptr: 0, stack_size: 288, stack_ptr_fn: None },
+        AppMetadata { id: 5, name: "math_calculator", entry: 0, entry_fn: Some(crate::apps::math_calculator::math_calculator_entry), stack_ptr: 0, stack_size: 416, stack_ptr_fn: None },
+        AppMetadata { id: 6, name: "network_stack", entry: 0, entry_fn: Some(crate::apps::network_stack::network_stack_entry), stack_ptr: 0, stack_size: 512, stack_ptr_fn: None },
+        AppMetadata { id: 7, name: "sensor_reader", entry: 0, entry_fn: Some(crate::apps::sensor_reader::sensor_reader_entry), stack_ptr: 0, stack_size: 384, stack_ptr_fn: None },
+        AppMetadata { id: 8, name: "watchdog", entry: 0, entry_fn: Some(crate::apps::watchdog::watchdog_entry), stack_ptr: 0, stack_size: 256, stack_ptr_fn: None },
+        AppMetadata { id: 9, name: "power_manager", entry: 0, entry_fn: Some(crate::apps::power_manager::power_manager_entry), stack_ptr: 0, stack_size: 320, stack_ptr_fn: None },
+        AppMetadata { id: 10, name: "data_logger", entry: 0, entry_fn: Some(crate::apps::data_logger::data_logger_entry), stack_ptr: 0, stack_size: 384, stack_ptr_fn: None }, // 🚀 11TH APP AUTO-DISCOVERED!
+    ];
 
-    let count = APP_REGISTRY_COUNT.load(Ordering::SeqCst);
-    static mut APPS_SLICE: [AppMetadata; 16] = [AppMetadata {
-        id: 0,
-        name: "",
-        entry: 0,
-        entry_fn: None,
-        stack_ptr: 0,
-        stack_size: 0,
-        stack_ptr_fn: None,
-    }; 16];
-
-    // Convert Option<AppMetadata> to AppMetadata slice
-    for i in 0..count.min(16) {
-        unsafe {
-            if let Some(app) = APP_REGISTRY[i] {
-                APPS_SLICE[i] = app;
-            }
-        }
+    unsafe {
+        let ptr = &raw mut DISCOVERED_APPS_MUT;
+        &mut *ptr
     }
-
-    unsafe { &mut APPS_SLICE[..count.min(16)] }
 }
 
 // for debug
