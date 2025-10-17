@@ -1,15 +1,17 @@
 //! Math Calculator Application
 //! Computes factorial calculations iteratively using Tock-style syscalls
 
+use app_macros::app;
+
 static mut MATH_RESULT: u32 = 1;
 static mut MATH_OPERATIONS: u32 = 0;
 
-// Automatic registration using new macro system
-crate::register_app!(math_calculator_entry, 5, "math_calculator", 416);
-
-#[unsafe(no_mangle)]
-pub extern "C" fn math_calculator_entry() -> ! {
-    crate::app_syscalls::debug_print(5, "Math Calculator Application started - computing factorials!");
+#[app(id = 5, stack_size = 416, name = "math_calculator")]
+fn math_calculator() -> ! {
+    crate::app_syscalls::debug_print(
+        5,
+        "Math Calculator Application started - computing factorials!",
+    );
 
     let mut n = 1u32;
 

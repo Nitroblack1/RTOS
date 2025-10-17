@@ -1,14 +1,13 @@
 //! Network Stack Application
 //! Simulates network packet processing using Tock-style syscalls
 
+use app_macros::app;
+
 static mut PACKET_COUNT: u32 = 0;
 static mut BYTES_PROCESSED: u32 = 0;
 
-// Automatic registration - just add this line!
-crate::register_app!(network_stack_entry, 6, "network_stack", 512);
-
-#[unsafe(no_mangle)]
-pub extern "C" fn network_stack_entry() -> ! {
+#[app(id = 6, stack_size = 512, name = "network_stack")]
+fn network_stack() -> ! {
     crate::app_syscalls::debug_print(6, "Network Stack Application started - processing packets!");
 
     loop {

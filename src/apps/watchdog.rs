@@ -2,12 +2,10 @@
 //! 진짜 링크 타임 디스커버리 테스트용 새 앱
 
 use crate::app_syscalls;
+use app_macros::app;
 
-// ✨ 진짜 자동 등록! 이 한 줄로 앱이 시스템에 자동으로 추가됨
-crate::register_app!(watchdog_entry, 8, "watchdog", 256);
-
-#[unsafe(no_mangle)]
-pub extern "C" fn watchdog_entry() -> ! {
+#[app(id = 8, stack_size = 256, name = "watchdog")]
+fn watchdog() -> ! {
     app_syscalls::debug_print(8, "🐕 Watchdog app 시작!");
 
     let mut heartbeat_count = 0u32;

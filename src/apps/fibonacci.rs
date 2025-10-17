@@ -1,41 +1,34 @@
 //! Fibonacci Calculator Application
 //! Computes fibonacci numbers and displays milestones using Tock-style syscalls
 
+use app_macros::app;
+use rtt_target::rprintln;
+
 static mut APP1_COUNTER: u32 = 0;
 static mut APP1_FIB_A: u32 = 0;
 static mut APP1_FIB_B: u32 = 1;
 static mut APP1_FIB_COUNT: u32 = 0;
 
-// Automatic registration using new macro system
-crate::register_app!(fibonacci_app_entry, 1, "fibonacci", 512);
+#[app(id = 1, stack_size = 512, name = "fibonacci")]
+pub fn fibonacci() -> ! {
+    // RTT 안정화 지연
+    for _ in 0..15000 {
+        cortex_m::asm::nop();
+    }
+    rprintln!("[FIB] start");
 
-#[unsafe(no_mangle)]
-pub extern "C" fn fibonacci_app_entry() -> ! {
-    crate::app_syscalls::debug_print(1, "Fibonacci Application started - computing fibonacci sequence!");
+    let mut counter = 0u32;
 
     loop {
-        unsafe {
-            APP1_COUNTER = APP1_COUNTER.wrapping_add(1);
+        counter = counter.wrapping_add(1);
 
-            // Calculate fibonacci every 100 iterations
-            if APP1_COUNTER % 100 == 0 {
-                let fib_next = APP1_FIB_A.wrapping_add(APP1_FIB_B);
-                APP1_FIB_A = APP1_FIB_B;
-                APP1_FIB_B = fib_next;
-                APP1_FIB_COUNT = APP1_FIB_COUNT.wrapping_add(1);
-
-                // Quick fibonacci milestones (every 5 calculations)
-                if APP1_FIB_COUNT % 5 == 0 {
-                    cortex_m::interrupt::disable();
-                    let _count = core::ptr::read_volatile(core::ptr::addr_of!(APP1_FIB_COUNT));
-                    let _fib = core::ptr::read_volatile(core::ptr::addr_of!(APP1_FIB_B));
-                    crate::app_syscalls::debug_print(1, "Fibonacci milestone reached");
-                    cortex_m::interrupt::enable();
-                }
-            }
+        if counter % 100 == 0 {
+            rprintln!("[FIB] {}", counter);
         }
 
-        // Use Tock-style cooperative yielding
-        crate::app_syscalls::yield_cpu();
+        // CPU 양보
+        for _ in 0..5000 {
+            cortex_m::asm::nop();
+        }
     }
 }

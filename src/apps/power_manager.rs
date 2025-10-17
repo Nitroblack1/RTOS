@@ -2,12 +2,10 @@
 //! 🚀 진짜 링크 타임 디스커버리 최종 검증용 새 앱
 
 use crate::app_syscalls;
+use app_macros::app;
 
-// ✨ 진짜 링크 타임 디스커버리! 이 한 줄로 링커 섹션에 메타데이터 자동 생성
-crate::register_app!(power_manager_entry, 9, "power_manager", 320);
-
-#[unsafe(no_mangle)]
-pub extern "C" fn power_manager_entry() -> ! {
+#[app(id = 9, stack_size = 320, name = "power_manager")]
+fn power_manager() -> ! {
     app_syscalls::debug_print(9, "⚡ Power Manager app 시작!");
 
     let mut power_check_count = 0u32;

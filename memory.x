@@ -16,10 +16,24 @@ SECTIONS
     *(.ccram .ccram.*);
   } > CCRAM
 
-  /* 🚀 실제 링크 타임 디스커버리: cortex-m-rt 섹션 레이아웃 존중 */
-  /* cortex-m-rt가 .rodata를 자동으로 적절한 위치에 배치하도록 함 */
-  /* register_app! 매크로의 #[link_section = ".rodata.app_meta"]가 */
-  /* 자동으로 .rodata 섹션에 포함됨 */
+  /* Per-application static stacks live in RAM */
+  .app_stacks (NOLOAD) : {
+    . = ALIGN(8);
+    __app_stacks_start = .;
+    KEEP(*(.app_stacks .app_stacks.*));
+    . = ALIGN(8);
+    __app_stacks_end = .;
+  } > RAM
+
+  /* 🚀 App registry section - temporarily disabled for dynamic demo */
+  /* .app_registry : {
+    . = ALIGN(4);
+    __app_registry_start = .;
+    KEEP(*(.app_registry));
+    KEEP(*(.app_registry.*));
+    . = ALIGN(4);
+    __app_registry_end = .;
+  } > FLASH */
 }
 
 /* 🚀 실용적 링크 타임 디스커버리: 링커가 자동으로 앱 메타데이터 수집함을 시뮬레이션 */

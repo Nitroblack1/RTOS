@@ -1,14 +1,13 @@
 //! Timer Application
 //! Counts seconds and tracks elapsed time using Tock-style syscalls
 
+use app_macros::app;
+
 static mut TIMER_TICKS: u32 = 0;
 static mut TIMER_SECONDS: u32 = 0;
 
-// Automatic registration using new macro system
-crate::register_app!(timer_app_entry, 3, "timer", 320);
-
-#[unsafe(no_mangle)]
-pub extern "C" fn timer_app_entry() -> ! {
+#[app(id = 3, stack_size = 320, name = "timer")]
+fn timer() -> ! {
     // Use Tock-style debug printing
     crate::app_syscalls::debug_print(3, "Timer Application started - counting seconds!");
 

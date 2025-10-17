@@ -1,6 +1,15 @@
 use proc_macro::TokenStream;
-use quote::quote;
-use syn::{parse_macro_input, ItemFn, parse::Parse, parse::ParseStream, Token, Ident, LitInt, LitStr};
+use quote::{format_ident, quote};
+use syn::{
+    parse::Parse,
+    parse::ParseStream,
+    parse_macro_input,
+    Ident,
+    ItemFn,
+    LitInt,
+    LitStr,
+    Token,
+};
 
 struct AppArgs {
     id: Option<LitInt>,
@@ -54,12 +63,9 @@ impl Parse for AppArgs {
 /// ```
 #[proc_macro_attribute]
 pub fn app(args: TokenStream, input: TokenStream) -> TokenStream {
-    let input_fn = parse_macro_input!(input as ItemFn);
-    let fn_name = &input_fn.sig.ident;
-    let fn_vis = &input_fn.vis;
-    let fn_block = &input_fn.block;
-    let _fn_inputs = &input_fn.sig.inputs; // Unused but may be needed for future enhancements
-    let _fn_output = &input_fn.sig.output; // Unused but may be needed for future enhancements
+    let mut entry_fn = parse_macro_input!(input as ItemFn);
+    let fn_name = entry_fn.sig.ident.clone();
+    let fn_span = fn_name.span();
 
     // Parse macro arguments
     let args = if args.is_empty() {
@@ -71,34 +77,55 @@ pub fn app(args: TokenStream, input: TokenStream) -> TokenStream {
     let app_id = args.id.expect("app macro requires 'id' parameter");
     let stack_size = args.stack_size.unwrap_or_else(|| syn::parse_str("512").unwrap());
     let app_name = args.name.unwrap_or_else(|| syn::parse_str(&format!("\"{}\"", fn_name)).unwrap());
+    let fn_upper = fn_name.to_string().to_uppercase();
+    let metadata_name = format_ident!("{}_METADATA", fn_upper);
+    let stack_words_name = format_ident!("{}_STACK_WORDS", fn_upper);
+    let stack_block_name = format_ident!("{}_STACK_BLOCK", fn_upper);
+    let stack_static_name = format_ident!("{}_STACK", fn_upper);
+    let stack_ptr_fn_name = format_ident!("{}_stack_ptr", fn_name);
 
-    let entry_fn_name = syn::Ident::new(&format!("{}_entry", fn_name), fn_name.span());
-    let metadata_name = syn::Ident::new(&format!("{}_METADATA", fn_name.to_string().to_uppercase()), fn_name.span());
-    let _stack_name = syn::Ident::new(&format!("{}_STACK", fn_name.to_string().to_uppercase()), fn_name.span()); // Future use
-    let _stack_ptr_fn_name = syn::Ident::new(&format!("{}_stack_ptr", fn_name), fn_name.span()); // Future use
+    let stack_size_value = stack_size.base10_parse::<usize>().expect("stack_size must be a positive integer");
+    let aligned_bytes = ((stack_size_value + 7) / 8) * 8; // Align to 8 bytes
+    let stack_words_value = (aligned_bytes + 3) / 4; // Convert bytes to 32-bit words
+
+    let stack_words_lit = syn::LitInt::new(&format!("{}usize", stack_words_value), fn_span);
+    let stack_size_bytes_u32 = syn::LitInt::new(&format!("{}u32", aligned_bytes), fn_span);
+
+    // Force function to use C ABI so scheduler can call it safely
+    entry_fn.sig.abi = Some(syn::Abi {
+        extern_token: syn::token::Extern { span: fn_span },
+        name: Some(LitStr::new("C", fn_span)),
+    });
+    entry_fn.attrs.retain(|attr| !attr.path().is_ident("app"));
 
     let expanded = quote! {
-        // Original function becomes the entry point - remove the original function signature issues
-        #[export_name = stringify!(#entry_fn_name)]
-        pub extern "C" fn #entry_fn_name() -> ! #fn_block
+        const #stack_words_name: usize = #stack_words_lit;
 
-        // App metadata stored in special linker section for automatic collection
-        #[link_section = ".apps"]
+        #[repr(align(8))]
+        struct #stack_block_name([u32; #stack_words_name]);
+
+        #[unsafe(link_section = ".app_stacks")]
+        #[used]
+        static mut #stack_static_name: #stack_block_name = #stack_block_name([0; #stack_words_name]);
+
+        #[inline(never)]
+        unsafe extern "C" fn #stack_ptr_fn_name() -> usize {
+            #stack_static_name.0.as_mut_ptr() as usize
+        }
+
+        #[unsafe(link_section = ".app_registry")]
         #[used]
         static #metadata_name: crate::AppMetadata = crate::AppMetadata {
             id: #app_id,
             name: #app_name,
-            entry: 0, // Will be resolved at runtime by finding the symbol
-            entry_fn: Some(#entry_fn_name), // Direct function pointer!
-            stack_ptr: 0, // Stack will be allocated by scheduler
-            stack_size: #stack_size,
-            stack_ptr_fn: None, // Not used with static allocation approach
+            entry: 0,
+            entry_fn: Some(#fn_name),
+            stack_ptr: 0,
+            stack_size: #stack_size_bytes_u32,
+            stack_ptr_fn: Some(#stack_ptr_fn_name),
         };
 
-        // Keep the original function name for user reference (remove parameters to avoid issues)
-        #fn_vis fn #fn_name() -> ! {
-            #entry_fn_name()
-        }
+        #entry_fn
     };
 
     TokenStream::from(expanded)

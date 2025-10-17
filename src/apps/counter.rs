@@ -1,32 +1,32 @@
 //! Counter Application
 //! Counts numbers and computes running sum using Tock-style syscalls
 
+use app_macros::app;
+use rtt_target::rprintln;
+
 static mut APP2_COUNTER: u32 = 3000;
 static mut APP2_SUM: u32 = 0;
 
-// Automatic registration using new macro system
-crate::register_app!(counter_app_entry, 2, "counter", 384);
+#[app(id = 2, stack_size = 384, name = "counter")]
+pub fn counter() -> ! {
+    // RTT 안정화 지연
+    for _ in 0..20000 {
+        cortex_m::asm::nop();
+    }
+    rprintln!("[COUNT] start");
 
-#[unsafe(no_mangle)]
-pub extern "C" fn counter_app_entry() -> ! {
-    crate::app_syscalls::debug_print(2, "Counter Application - prime number finder started!");
+    let mut counter = 0u32;
 
     loop {
-        unsafe {
-            APP2_COUNTER = APP2_COUNTER.wrapping_add(1);
-            APP2_SUM = APP2_SUM.wrapping_add(APP2_COUNTER);
+        counter = counter.wrapping_add(1);
 
-            // Frequent output for quick feedback
-            if APP2_COUNTER % 500 == 0 {
-                cortex_m::interrupt::disable();
-                let _c = core::ptr::read_volatile(core::ptr::addr_of!(APP2_COUNTER));
-                let _s = core::ptr::read_volatile(core::ptr::addr_of!(APP2_SUM));
-                crate::app_syscalls::debug_print(2, "Counter milestone reached");
-                cortex_m::interrupt::enable();
-            }
+        if counter % 100 == 0 {
+            rprintln!("[COUNT] {}", counter);
         }
 
-        // Use Tock-style cooperative yielding
-        crate::app_syscalls::yield_cpu();
+        // CPU 양보
+        for _ in 0..5000 {
+            cortex_m::asm::nop();
+        }
     }
 }
