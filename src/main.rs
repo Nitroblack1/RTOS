@@ -659,13 +659,15 @@ mod mpu {
         // For now, we'll just set up a basic protection scheme
 
         // Protect the entire SRAM as privileged access only initially
-        configure_region(0, 0x2000_0000, region_size_encoding(128 * 1024)?,
-                        MPU_AP_PRIV_RW, false)?;
+        unsafe {
+            configure_region(0, 0x2000_0000, region_size_encoding(128 * 1024)?,
+                            MPU_AP_PRIV_RW, false)?;
 
-        // Region 1: Allow app stack area to have user access
-        // This would be refined to per-task regions in a full implementation
-        configure_region(1, 0x2000_8000, region_size_encoding(64 * 1024)?,
-                        MPU_AP_PRIV_RW_USER_RW, true)?; // Execute never for stack
+            // Region 1: Allow app stack area to have user access
+            // This would be refined to per-task regions in a full implementation
+            configure_region(1, 0x2000_8000, region_size_encoding(64 * 1024)?,
+                            MPU_AP_PRIV_RW_USER_RW, true)?; // Execute never for stack
+        }
 
         rprintln!("[MPU] Basic memory regions configured");
         Ok(())
@@ -682,22 +684,24 @@ mod mpu {
             return Err("Invalid region number");
         }
 
-        // Select region
-        core::ptr::write_volatile(MPU_RNR, region_num as u32);
+        unsafe {
+            // Select region
+            core::ptr::write_volatile(MPU_RNR, region_num as u32);
 
-        // Set base address (must be aligned to region size)
-        core::ptr::write_volatile(MPU_RBAR, base_addr);
+            // Set base address (must be aligned to region size)
+            core::ptr::write_volatile(MPU_RBAR, base_addr);
 
-        // Set region attributes
-        let mut rasr = MPU_RASR_ENABLE |
-                      (size_encoding << MPU_RASR_SIZE_SHIFT) |
-                      (access_permission << MPU_RASR_AP_SHIFT);
+            // Set region attributes
+            let mut rasr = MPU_RASR_ENABLE |
+                          (size_encoding << MPU_RASR_SIZE_SHIFT) |
+                          (access_permission << MPU_RASR_AP_SHIFT);
 
-        if execute_never {
-            rasr |= MPU_RASR_XN;
+            if execute_never {
+                rasr |= MPU_RASR_XN;
+            }
+
+            core::ptr::write_volatile(MPU_RASR, rasr);
         }
-
-        core::ptr::write_volatile(MPU_RASR, rasr);
 
         rprintln!("[MPU] Region {} configured: base=0x{:08x}, size={}, ap={:03b}, xn={}",
                  region_num, base_addr, size_encoding, access_permission, execute_never);
@@ -737,8 +741,10 @@ mod mpu {
         let base_addr = stack_base as u32;
         let size_encoding = region_size_encoding(stack_size as usize)?;
 
-        configure_region(region_num, base_addr, size_encoding,
-                        MPU_AP_PRIV_RW_USER_RW, true) // Stack is XN (execute never)
+        unsafe {
+            configure_region(region_num, base_addr, size_encoding,
+                            MPU_AP_PRIV_RW_USER_RW, true) // Stack is XN (execute never)
+        }
     }
 }
 
