@@ -85,7 +85,14 @@ pub fn app(args: TokenStream, input: TokenStream) -> TokenStream {
     let stack_ptr_fn_name = format_ident!("{}_stack_ptr", fn_name);
 
     let stack_size_value = stack_size.base10_parse::<usize>().expect("stack_size must be a positive integer");
-    let aligned_bytes = ((stack_size_value + 7) / 8) * 8; // Align to 8 bytes
+    // Enforce kernel minimum stack size (512 bytes)
+    let min_stack_bytes = 512;
+    let requested_bytes = if stack_size_value < min_stack_bytes {
+        min_stack_bytes
+    } else {
+        stack_size_value
+    };
+    let aligned_bytes = ((requested_bytes + 7) / 8) * 8; // Align to 8 bytes
     let stack_words_value = (aligned_bytes + 3) / 4; // Convert bytes to 32-bit words
 
     let stack_words_lit = syn::LitInt::new(&format!("{}usize", stack_words_value), fn_span);

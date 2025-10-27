@@ -1,7 +1,6 @@
 //! LED Blinker Application
 //! Blinks the onboard LED in a periodic pattern using Tock-style syscalls
 
-use crate::GpioPin;
 use app_macros::app;
 use rtt_target::rprintln;
 

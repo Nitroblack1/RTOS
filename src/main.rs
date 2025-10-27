@@ -68,17 +68,74 @@ static APP_REGISTRY_READY: AtomicBool = AtomicBool::new(false);
 static APP_REGISTRY_COUNT: AtomicUsize = AtomicUsize::new(0);
 static mut APP_REGISTRY: [AppMetadata; MAX_APPS] = [AppMetadata::empty(); MAX_APPS];
 
-/// 🚀 링커 기반 앱 발견 시스템 상태 리포트
-fn discover_linker_registered_apps() -> usize {
-    rprintln!("[REGISTRY] 동적 태스크 전용 모드");
-    0
+/// 🚀 링커 기반 앱 발견 시스템 - 실제 섹션 스캔 구현
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn discover_linker_registered_apps() -> usize {
+    let start = &__app_registry_start as *const u8 as usize;
+    let end = &__app_registry_end as *const u8 as usize;
+    let total_bytes = end.saturating_sub(start);
+
+    rprintln!("[REGISTRY] Scanning app registry section:");
+    rprintln!("  Start: 0x{:08x}", start);
+    rprintln!("  End:   0x{:08x}", end);
+    rprintln!("  Size:  {} bytes", total_bytes);
+
+    if total_bytes == 0 {
+        rprintln!("[REGISTRY] No apps found in registry section");
+        return 0;
+    }
+
+    let metadata_size = core::mem::size_of::<AppMetadata>();
+    if total_bytes % metadata_size != 0 {
+        rprintln!(
+            "[FATAL] Registry section size {} is not aligned to AppMetadata size {}",
+            total_bytes, metadata_size
+        );
+        loop {}
+    }
+
+    let app_count = total_bytes / metadata_size;
+    if app_count > MAX_APPS {
+        rprintln!(
+            "[FATAL] Too many apps in registry: {} > {}",
+            app_count, MAX_APPS
+        );
+        loop {}
+    }
+
+    rprintln!("[REGISTRY] Found {} registered apps", app_count);
+
+    // Create slice from the registry section
+    let app_metadata_slice = unsafe {
+        core::slice::from_raw_parts(
+            start as *const AppMetadata,
+            app_count,
+        )
+    };
+
+    // Copy apps from linker section to runtime registry
+    for (i, app) in app_metadata_slice.iter().enumerate() {
+        rprintln!(
+            "[REGISTRY] App {}: id={} name='{}' entry_fn={:?} stack_size={}",
+            i, app.id, app.name,
+            app.entry_fn.map(|f| f as usize),
+            app.stack_size
+        );
+
+        if i < MAX_APPS {
+            unsafe { APP_REGISTRY[i] = *app; }
+        }
+    }
+
+    app_count
 }
 
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn populate_registry_from_linker() {
-    let _app_count = discover_linker_registered_apps();
+    let app_count = discover_linker_registered_apps();
 
-    APP_REGISTRY_COUNT.store(0, Ordering::Release);
+    APP_REGISTRY_COUNT.store(app_count, Ordering::Release);
+    rprintln!("[REGISTRY] Registry populated with {} apps", app_count);
 }
 
 
@@ -531,6 +588,157 @@ mod svc {
         fn gpio_toggle(&mut self, _pin: GpioPin) {
             let _ = svc_call(abi::GPIO_TOGGLE, 0, 0, 0, 0);
         }
+    }
+}
+
+// ───────────── MPU (Memory Protection Unit) ─────────────
+
+mod mpu {
+    use rtt_target::rprintln;
+
+    // MPU register addresses for Cortex-M4
+    const MPU_TYPE: *mut u32 = 0xE000_ED90 as *mut u32;
+    const MPU_CTRL: *mut u32 = 0xE000_ED94 as *mut u32;
+    const MPU_RNR: *mut u32 = 0xE000_ED98 as *mut u32;   // Region Number Register
+    const MPU_RBAR: *mut u32 = 0xE000_ED9C as *mut u32;  // Region Base Address Register
+    const MPU_RASR: *mut u32 = 0xE000_EDA0 as *mut u32;  // Region Attribute and Size Register
+
+    // MPU control register bits
+    const MPU_CTRL_ENABLE: u32 = 1 << 0;
+    const MPU_CTRL_HFNMIENA: u32 = 1 << 1;  // Enable during fault handlers
+    const MPU_CTRL_PRIVDEFENA: u32 = 1 << 2; // Enable privileged default memory map
+
+    // Region attribute bits
+    const MPU_RASR_ENABLE: u32 = 1 << 0;
+    const MPU_RASR_SIZE_SHIFT: u32 = 1;
+    const MPU_RASR_AP_SHIFT: u32 = 24;  // Access Permission
+    const MPU_RASR_XN: u32 = 1 << 28;   // Execute Never
+
+    // Access permissions
+    const MPU_AP_NO_ACCESS: u32 = 0b000;
+    const MPU_AP_PRIV_RW: u32 = 0b001;      // Privileged R/W, unprivileged no access
+    const MPU_AP_PRIV_RW_USER_RO: u32 = 0b010; // Privileged R/W, unprivileged R
+    const MPU_AP_PRIV_RW_USER_RW: u32 = 0b011; // Privileged R/W, unprivileged R/W
+
+    pub fn init_mpu() -> Result<(), &'static str> {
+        unsafe {
+            // Check if MPU is present
+            let mpu_type = core::ptr::read_volatile(MPU_TYPE);
+            let num_regions = (mpu_type >> 8) & 0xFF;
+
+            if num_regions == 0 {
+                rprintln!("[MPU] MPU not present on this device");
+                return Err("MPU not available");
+            }
+
+            rprintln!("[MPU] Initializing MPU with {} regions", num_regions);
+
+            // Disable MPU while configuring
+            core::ptr::write_volatile(MPU_CTRL, 0);
+
+            // Memory barrier to ensure MPU is disabled
+            core::arch::asm!("dsb", "isb", options(nomem, nostack));
+
+            // Configure basic regions
+            configure_basic_regions()?;
+
+            // Enable MPU with privileged default memory map enabled
+            core::ptr::write_volatile(MPU_CTRL,
+                MPU_CTRL_ENABLE | MPU_CTRL_HFNMIENA | MPU_CTRL_PRIVDEFENA);
+
+            // Memory barrier to ensure MPU configuration is complete
+            core::arch::asm!("dsb", "isb", options(nomem, nostack));
+
+            rprintln!("[MPU] MPU initialization complete");
+            Ok(())
+        }
+    }
+
+    unsafe fn configure_basic_regions() -> Result<(), &'static str> {
+        // Region 0: Protect kernel stack (example - adjust based on actual stack location)
+        // For now, we'll just set up a basic protection scheme
+
+        // Protect the entire SRAM as privileged access only initially
+        configure_region(0, 0x2000_0000, region_size_encoding(128 * 1024)?,
+                        MPU_AP_PRIV_RW, false)?;
+
+        // Region 1: Allow app stack area to have user access
+        // This would be refined to per-task regions in a full implementation
+        configure_region(1, 0x2000_8000, region_size_encoding(64 * 1024)?,
+                        MPU_AP_PRIV_RW_USER_RW, true)?; // Execute never for stack
+
+        rprintln!("[MPU] Basic memory regions configured");
+        Ok(())
+    }
+
+    unsafe fn configure_region(
+        region_num: u8,
+        base_addr: u32,
+        size_encoding: u32,
+        access_permission: u32,
+        execute_never: bool
+    ) -> Result<(), &'static str> {
+        if region_num >= 8 {
+            return Err("Invalid region number");
+        }
+
+        // Select region
+        core::ptr::write_volatile(MPU_RNR, region_num as u32);
+
+        // Set base address (must be aligned to region size)
+        core::ptr::write_volatile(MPU_RBAR, base_addr);
+
+        // Set region attributes
+        let mut rasr = MPU_RASR_ENABLE |
+                      (size_encoding << MPU_RASR_SIZE_SHIFT) |
+                      (access_permission << MPU_RASR_AP_SHIFT);
+
+        if execute_never {
+            rasr |= MPU_RASR_XN;
+        }
+
+        core::ptr::write_volatile(MPU_RASR, rasr);
+
+        rprintln!("[MPU] Region {} configured: base=0x{:08x}, size={}, ap={:03b}, xn={}",
+                 region_num, base_addr, size_encoding, access_permission, execute_never);
+
+        Ok(())
+    }
+
+    // Convert size in bytes to MPU region size encoding
+    // MPU region size = 2^(encoding + 1), minimum size is 32 bytes (encoding = 4)
+    fn region_size_encoding(size_bytes: usize) -> Result<u32, &'static str> {
+        if size_bytes < 32 {
+            return Err("Region too small (minimum 32 bytes)");
+        }
+
+        // Find the power of 2 that covers the size
+        let mut encoding = 4; // Start with 32 bytes (2^5 = 32)
+        let mut region_size = 32;
+
+        while region_size < size_bytes && encoding < 31 {
+            encoding += 1;
+            region_size <<= 1;
+        }
+
+        if encoding > 31 {
+            return Err("Region too large");
+        }
+
+        Ok(encoding)
+    }
+
+    // Configure MPU for a specific task stack
+    pub unsafe fn configure_task_stack_protection(
+        region_num: u8,
+        stack_base: *mut u32,
+        stack_size: u32
+    ) -> Result<(), &'static str> {
+        let base_addr = stack_base as u32;
+        let size_encoding = region_size_encoding(stack_size as usize)?;
+
+        configure_region(region_num, base_addr, size_encoding,
+                        MPU_AP_PRIV_RW_USER_RW, true) // Stack is XN (execute never)
     }
 }
 
@@ -1163,8 +1371,14 @@ mod sched {
     pub fn start() -> ! {
         rprintln!("[SCHED] Starting...");
 
-        // 🚀 스케줄러 초기화 완료 후 동적 태스크 생성
-        spawn_demo_tasks();
+        // Check if we have linker-discovered apps, if not fall back to dynamic spawning
+        let task_count = unsafe { N_TASKS };
+        if task_count == 0 {
+            rprintln!("[SCHED] No linker-registered apps found, falling back to dynamic task spawning");
+            spawn_demo_tasks();
+        } else {
+            rprintln!("[SCHED] Using {} linker-discovered apps", task_count);
+        }
 
         unsafe {
             let mut scb = cortex_m::Peripherals::take().unwrap().SCB;
@@ -1190,7 +1404,7 @@ mod sched {
 
             if FIRST_SWITCH {
                 FIRST_SWITCH = false;
-                // rprintln!("[🚀 START] Task 0");
+                rprintln!("[🚀 START] Task 0");
 
                 // Mark task 0 as running
                 TCBS[0].state = TaskState::Running;
@@ -1203,7 +1417,7 @@ mod sched {
                 let current_task = CURR;
                 let next_task = (current_task + 1) % N_TASKS;
 
-                // rprintln!("[🔄 SWITCH] Task {} → Task {}", current_task, next_task);
+                rprintln!("[🔄 SWITCH] Task {} → Task {}", current_task, next_task);
 
                 // Update task states
                 TCBS[current_task].state = TaskState::Ready;
@@ -1336,6 +1550,9 @@ mod sched {
 
     #[exception]
     fn SysTick() {
+        static mut SYSTICK_COUNT: u32 = 0;
+        *SYSTICK_COUNT += 1;
+        rprintln!("[SYSTICK] {} - Triggering PendSV", *SYSTICK_COUNT);
         // Trigger PendSV every 2 seconds
         cortex_m::peripheral::SCB::set_pendsv();
     }
@@ -1537,6 +1754,13 @@ fn main() -> ! {
     }
 
     rprintln!("[MAIN] Board initialization complete");
+
+    // Initialize MPU for memory protection
+    rprintln!("[MAIN] Initializing MPU...");
+    match mpu::init_mpu() {
+        Ok(_) => rprintln!("[MAIN] MPU initialization successful"),
+        Err(e) => rprintln!("[MAIN] MPU initialization failed: {}", e),
+    }
 
     rprintln!("[MAIN] Initializing OS...");
     unsafe {
