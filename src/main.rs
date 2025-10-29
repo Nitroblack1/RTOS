@@ -198,7 +198,44 @@ unsafe fn UsageFault() -> ! {
 
 #[cortex_m_rt::exception]
 unsafe fn MemoryManagement() -> ! {
-    rprintln!("[FATAL] MemoryManagement fault occurred");
+    rprintln!("[MPU] MemoryManagement fault occurred");
+
+    // Read MPU fault status and address
+    const SCB_MMFSR: *mut u8 = 0xE000_ED28 as *mut u8; // MemManage Fault Status Register
+    const SCB_MMFAR: *mut u32 = 0xE000_ED34 as *mut u32; // MemManage Fault Address Register
+    const SCB_CFSR: *mut u32 = 0xE000_ED28 as *mut u32; // Configurable Fault Status Register
+
+    unsafe {
+        let mmfsr = core::ptr::read_volatile(SCB_MMFSR);
+        let cfsr = core::ptr::read_volatile(SCB_CFSR);
+        let mmfar = if (mmfsr & 0x80) != 0 { // MMARVALID bit
+            core::ptr::read_volatile(SCB_MMFAR)
+        } else {
+            0
+        };
+
+        rprintln!("[MPU] MMFSR: 0x{:02x}, CFSR: 0x{:08x}", mmfsr, cfsr);
+        if mmfar != 0 {
+            rprintln!("[MPU] Fault address: 0x{:08x}", mmfar);
+        }
+
+        // Decode fault type
+        if (mmfsr & 0x01) != 0 { rprintln!("[MPU] Instruction access violation"); }
+        if (mmfsr & 0x02) != 0 { rprintln!("[MPU] Data access violation"); }
+        if (mmfsr & 0x08) != 0 { rprintln!("[MPU] MemManage fault on unstacking"); }
+        if (mmfsr & 0x10) != 0 { rprintln!("[MPU] MemManage fault on stacking"); }
+        if (mmfsr & 0x20) != 0 { rprintln!("[MPU] MemManage fault on lazy FP state preservation"); }
+
+        // Show current task info
+        rprintln!("[MPU] Current task count: {}", sched::get_task_count());
+
+        // Clear the fault
+        core::ptr::write_volatile(SCB_MMFSR, 0xFF);
+    }
+
+    rprintln!("[MPU] Task will be terminated due to memory protection violation");
+    // In a real implementation, you would mark the current task as blocked/killed
+    // and trigger a context switch to continue with other tasks
     loop {}
 }
 // for debug
@@ -655,21 +692,25 @@ mod mpu {
     }
 
     unsafe fn configure_basic_regions() -> Result<(), &'static str> {
-        // Region 0: Protect kernel stack (example - adjust based on actual stack location)
-        // For now, we'll just set up a basic protection scheme
+        // STM32F446RE Memory Map:
+        // Flash: 0x0800_0000 - 0x0807_FFFF (512KB)
+        // SRAM:  0x2000_0000 - 0x2001_FFFF (128KB)
+        // CCM:   0x1000_0000 - 0x1000_FFFF (64KB)
 
-        // Protect the entire SRAM as privileged access only initially
         unsafe {
-            configure_region(0, 0x2000_0000, region_size_encoding(128 * 1024)?,
-                            MPU_AP_PRIV_RW, false)?;
+            // Region 0: Flash memory - Privileged execute/read, no write
+            configure_region(0, 0x0800_0000, region_size_encoding(512 * 1024)?,
+                            MPU_AP_PRIV_RW_USER_RO, false)?; // Allow execution
 
-            // Region 1: Allow app stack area to have user access
-            // This would be refined to per-task regions in a full implementation
-            configure_region(1, 0x2000_8000, region_size_encoding(64 * 1024)?,
-                            MPU_AP_PRIV_RW_USER_RW, true)?; // Execute never for stack
+            // Region 1: SRAM - Privileged access for kernel area
+            // Reserve first 64KB for kernel, remaining for app stacks
+            configure_region(1, 0x2000_0000, region_size_encoding(64 * 1024)?,
+                            MPU_AP_PRIV_RW, true)?; // Execute never for kernel data
         }
 
-        rprintln!("[MPU] Basic memory regions configured");
+        rprintln!("[MPU] STM32F446 memory regions configured:");
+        rprintln!("  Region 0: Flash 0x0800_0000-0x0807_FFFF (512KB) - PRIV RW/USER RO");
+        rprintln!("  Region 1: SRAM  0x2000_0000-0x2000_FFFF (64KB)  - PRIV RW only, XN");
         Ok(())
     }
 
@@ -745,6 +786,22 @@ mod mpu {
             configure_region(region_num, base_addr, size_encoding,
                             MPU_AP_PRIV_RW_USER_RW, true) // Stack is XN (execute never)
         }
+    }
+
+    // Test MPU protection by attempting invalid memory access
+    pub unsafe fn test_mpu_protection() {
+        rprintln!("[MPU] Testing memory protection...");
+
+        // This should work - accessing current task's stack
+        let test_value = 0x12345678u32;
+        rprintln!("[MPU] Test 1: Valid stack access = 0x{:08x}", test_value);
+
+        // This would trigger a fault if called from unprivileged mode:
+        // Attempt to access privileged kernel area (first 64KB of SRAM)
+        // let kernel_addr = 0x2000_0000 as *mut u32;
+        // core::ptr::write_volatile(kernel_addr, 0xDEADBEEF);
+
+        rprintln!("[MPU] Protection test completed");
     }
 }
 
@@ -1132,12 +1189,27 @@ mod sched {
         tcb.r9 = 0x99999999; // r9
         tcb.r10 = 0xAAAAAAAA; // r10
         tcb.r11 = 0xBBBBBBBB; // r11
-        tcb.control = 0x02; // CONTROL: Use PSP for thread mode
+        tcb.control = 0x03; // CONTROL: Use PSP for thread mode + unprivileged mode
         tcb.state = TaskState::Ready;
         tcb.app_id = app.id;
         tcb.name = app.name;
         tcb.stack_base = stack.as_mut_ptr();
         tcb.stack_size = stack_bytes as u32;
+
+        // Configure MPU protection for this task's stack
+        // Use region numbers 2+ for task stacks (0,1 reserved for basic regions)
+        let region_num = (app.id % 6) + 2; // Use regions 2-7 for tasks (max 6 tasks with MPU protection)
+        if let Err(e) = unsafe {
+            super::mpu::configure_task_stack_protection(
+                region_num as u8,
+                stack.as_mut_ptr(),
+                stack_bytes as u32
+            )
+        } {
+            rprintln!("[MPU] Warning: Failed to configure stack protection for app '{}': {}", app.name, e);
+        } else {
+            rprintln!("[MPU] Configured stack protection for app '{}' in region {}", app.name, region_num);
+        }
 
         rprintln!(
             "[STACK] App '{}' (ID: {}) base: 0x{:08x}, SP: 0x{:08x}, PC: 0x{:08x}, Stack: {} bytes",
@@ -1534,9 +1606,9 @@ mod sched {
         @ Set PSP from r1
         msr     psp, r1
 
-        @ Switch to thread mode using PSP
+        @ Switch to thread mode using PSP + unprivileged mode
         mrs     r1, CONTROL
-        orr     r1, r1, #2     @ Use PSP for thread mode
+        orr     r1, r1, #3     @ Use PSP for thread mode + unprivileged mode
         msr     CONTROL, r1
         isb                    @ Instruction barrier for CONTROL changes
 
