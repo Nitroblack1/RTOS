@@ -98,12 +98,21 @@ pub fn app(args: TokenStream, input: TokenStream) -> TokenStream {
     let stack_words_lit = syn::LitInt::new(&format!("{}usize", stack_words_value), fn_span);
     let stack_size_bytes_u32 = syn::LitInt::new(&format!("{}u32", aligned_bytes), fn_span);
 
-    // Force function to use C ABI so scheduler can call it safely
-    entry_fn.sig.abi = Some(syn::Abi {
-        extern_token: syn::token::Extern { span: fn_span },
-        name: Some(LitStr::new("C", fn_span)),
-    });
+    // Only add ABI if not already present
+    if entry_fn.sig.abi.is_none() {
+        entry_fn.sig.abi = Some(syn::Abi {
+            extern_token: syn::token::Extern { span: fn_span },
+            name: Some(LitStr::new("C", fn_span)),
+        });
+    }
+
+    // Only add unsafe if not already present
+    if entry_fn.sig.unsafety.is_none() {
+        entry_fn.sig.unsafety = Some(syn::token::Unsafe { span: fn_span });
+    }
     entry_fn.attrs.retain(|attr| !attr.path().is_ident("app"));
+
+    // Don't add #[no_mangle] to avoid unsafe attribute issues
 
     let expanded = quote! {
         const #stack_words_name: usize = #stack_words_lit;
@@ -111,16 +120,15 @@ pub fn app(args: TokenStream, input: TokenStream) -> TokenStream {
         #[repr(align(8))]
         struct #stack_block_name([u32; #stack_words_name]);
 
-        #[unsafe(link_section = ".app_stacks")]
         #[used]
         static mut #stack_static_name: #stack_block_name = #stack_block_name([0; #stack_words_name]);
 
         #[inline(never)]
         unsafe extern "C" fn #stack_ptr_fn_name() -> usize {
-            #stack_static_name.0.as_mut_ptr() as usize
+            unsafe { #stack_static_name.0.as_mut_ptr() as usize }
         }
 
-        #[unsafe(link_section = ".app_registry")]
+        // For now, just create metadata without link_section to test ABI
         #[used]
         static #metadata_name: crate::AppMetadata = crate::AppMetadata {
             id: #app_id,

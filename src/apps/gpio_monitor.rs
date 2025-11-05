@@ -7,7 +7,10 @@ static mut GPIO_MONITOR_COUNT: u32 = 0;
 static mut GPIO_STATE_CHANGES: u32 = 0;
 
 #[app(id = 4, stack_size = 288, name = "gpio_monitor")]
-fn gpio_monitor() -> ! {
+pub unsafe extern "C" fn gpio_monitor() -> ! {
+    // Direct RTT log to bypass syscall system
+    rtt_target::rprintln!("[APP] gpio_monitor ENTERED - direct RTT log");
+
     crate::app_syscalls::debug_print(
         4,
         "GPIO Monitor Application started - monitoring virtual GPIO!",

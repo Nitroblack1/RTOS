@@ -5,7 +5,10 @@ use crate::app_syscalls;
 use app_macros::app;
 
 #[app(id = 9, stack_size = 320, name = "power_manager")]
-fn power_manager() -> ! {
+pub unsafe extern "C" fn power_manager() -> ! {
+    // Direct RTT log to bypass syscall system
+    rtt_target::rprintln!("[APP] power_manager ENTERED - direct RTT log");
+
     app_syscalls::debug_print(9, "⚡ Power Manager app 시작!");
 
     let mut power_check_count = 0u32;

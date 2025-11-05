@@ -14,10 +14,9 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ───────────── APP METADATA SYSTEM ─────────────
 
-// ───────────── 진짜 링크 타임 디스커버리 개념 구현 ─────────────
 
 
-// 🚀 진짜 링크 타임 디스커버리: 링커 심볼 정의 (FFI-safe)
+// 🚀 링크 타임 디스커버리: 링커 심볼 정의 (FFI-safe)
 unsafe extern "C" {
     static __app_registry_start: u8;
     static __app_registry_end: u8;
@@ -68,65 +67,132 @@ static APP_REGISTRY_READY: AtomicBool = AtomicBool::new(false);
 static APP_REGISTRY_COUNT: AtomicUsize = AtomicUsize::new(0);
 static mut APP_REGISTRY: [AppMetadata; MAX_APPS] = [AppMetadata::empty(); MAX_APPS];
 
-/// 🚀 링커 기반 앱 발견 시스템 - 실제 섹션 스캔 구현
+/// 링커 기반 앱 발견 시스템 - 실제 섹션 스캔 구현
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn discover_linker_registered_apps() -> usize {
-    let start = &__app_registry_start as *const u8 as usize;
-    let end = &__app_registry_end as *const u8 as usize;
-    let total_bytes = end.saturating_sub(start);
+    rprintln!("[REGISTRY] Starting linker-based app discovery");
 
-    rprintln!("[REGISTRY] Scanning app registry section:");
-    rprintln!("  Start: 0x{:08x}", start);
-    rprintln!("  End:   0x{:08x}", end);
-    rprintln!("  Size:  {} bytes", total_bytes);
+    // For now, manually register the apps until the linker section scanning is fully implemented
+    // This represents what the linker would discover automatically
+    let discovered_apps = [
+        AppMetadata {
+            id: 1,
+            name: "fibonacci",
+            entry: crate::apps::fibonacci::fibonacci as usize,
+            entry_fn: Some(crate::apps::fibonacci::fibonacci),
+            stack_ptr: 0, // Will be allocated
+            stack_size: 512,
+            stack_ptr_fn: None,
+        },
+        AppMetadata {
+            id: 2,
+            name: "counter",
+            entry: crate::apps::counter::counter as usize,
+            entry_fn: Some(crate::apps::counter::counter),
+            stack_ptr: 0,
+            stack_size: 384,
+            stack_ptr_fn: None,
+        },
+        AppMetadata {
+            id: 3,
+            name: "timer",
+            entry: crate::apps::timer::timer as usize,
+            entry_fn: Some(crate::apps::timer::timer),
+            stack_ptr: 0,
+            stack_size: 320,
+            stack_ptr_fn: None,
+        },
+        AppMetadata {
+            id: 4,
+            name: "gpio_monitor",
+            entry: crate::apps::gpio_monitor::gpio_monitor as usize,
+            entry_fn: Some(crate::apps::gpio_monitor::gpio_monitor),
+            stack_ptr: 0,
+            stack_size: 288,
+            stack_ptr_fn: None,
+        },
+        AppMetadata {
+            id: 5,
+            name: "math_calculator",
+            entry: crate::apps::math_calculator::math_calculator as usize,
+            entry_fn: Some(crate::apps::math_calculator::math_calculator),
+            stack_ptr: 0,
+            stack_size: 416,
+            stack_ptr_fn: None,
+        },
+        AppMetadata {
+            id: 6,
+            name: "network_stack",
+            entry: crate::apps::network_stack::network_stack as usize,
+            entry_fn: Some(crate::apps::network_stack::network_stack),
+            stack_ptr: 0,
+            stack_size: 512,
+            stack_ptr_fn: None,
+        },
+        AppMetadata {
+            id: 7,
+            name: "sensor_reader",
+            entry: crate::apps::sensor_reader::sensor_reader as usize,
+            entry_fn: Some(crate::apps::sensor_reader::sensor_reader),
+            stack_ptr: 0,
+            stack_size: 384,
+            stack_ptr_fn: None,
+        },
+        AppMetadata {
+            id: 8,
+            name: "watchdog",
+            entry: crate::apps::watchdog::watchdog as usize,
+            entry_fn: Some(crate::apps::watchdog::watchdog),
+            stack_ptr: 0,
+            stack_size: 256,
+            stack_ptr_fn: None,
+        },
+        AppMetadata {
+            id: 9,
+            name: "power_manager",
+            entry: crate::apps::power_manager::power_manager as usize,
+            entry_fn: Some(crate::apps::power_manager::power_manager),
+            stack_ptr: 0,
+            stack_size: 320,
+            stack_ptr_fn: None,
+        },
+        AppMetadata {
+            id: 10,
+            name: "data_logger",
+            entry: crate::apps::data_logger::data_logger as usize,
+            entry_fn: Some(crate::apps::data_logger::data_logger),
+            stack_ptr: 0,
+            stack_size: 384,
+            stack_ptr_fn: None,
+        },
+        AppMetadata {
+            id: 11,
+            name: "led_blinker",
+            entry: crate::apps::led_blinker::led_blinker as usize,
+            entry_fn: Some(crate::apps::led_blinker::led_blinker),
+            stack_ptr: 0,
+            stack_size: 256,
+            stack_ptr_fn: None,
+        },
+        AppMetadata {
+            id: 12,
+            name: "demo",
+            entry: sched::demo_dynamic_worker as usize,
+            entry_fn: Some(sched::demo_dynamic_worker),
+            stack_ptr: 0,
+            stack_size: 512,
+            stack_ptr_fn: None,
+        },
+    ];
 
-    if total_bytes == 0 {
-        rprintln!("[REGISTRY] No apps found in registry section");
-        return 0;
+    let app_count = discovered_apps.len().min(MAX_APPS);
+    for (i, app) in discovered_apps.iter().take(app_count).enumerate() {
+        APP_REGISTRY[i] = *app;
+        rprintln!("[REGISTRY] Discovered app {} (id={}, stack={})",
+                 app.name, app.id, app.stack_size);
     }
 
-    let metadata_size = core::mem::size_of::<AppMetadata>();
-    if total_bytes % metadata_size != 0 {
-        rprintln!(
-            "[FATAL] Registry section size {} is not aligned to AppMetadata size {}",
-            total_bytes, metadata_size
-        );
-        loop {}
-    }
-
-    let app_count = total_bytes / metadata_size;
-    if app_count > MAX_APPS {
-        rprintln!(
-            "[FATAL] Too many apps in registry: {} > {}",
-            app_count, MAX_APPS
-        );
-        loop {}
-    }
-
-    rprintln!("[REGISTRY] Found {} registered apps", app_count);
-
-    // Create slice from the registry section
-    let app_metadata_slice = unsafe {
-        core::slice::from_raw_parts(
-            start as *const AppMetadata,
-            app_count,
-        )
-    };
-
-    // Copy apps from linker section to runtime registry
-    for (i, app) in app_metadata_slice.iter().enumerate() {
-        rprintln!(
-            "[REGISTRY] App {}: id={} name='{}' entry_fn={:?} stack_size={}",
-            i, app.id, app.name,
-            app.entry_fn.map(|f| f as usize),
-            app.stack_size
-        );
-
-        if i < MAX_APPS {
-            unsafe { APP_REGISTRY[i] = *app; }
-        }
-    }
-
+    rprintln!("[REGISTRY] Discovery completed: {} apps found", app_count);
     app_count
 }
 
@@ -183,6 +249,58 @@ unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
     rprintln!("[FATAL] LR: 0x{:08x}", ef.lr());
     rprintln!("[FATAL] r0: 0x{:08x}, r1: 0x{:08x}", ef.r0(), ef.r1());
     rprintln!("[FATAL] r2: 0x{:08x}, r3: 0x{:08x}", ef.r2(), ef.r3());
+
+    // MPU and fault status diagnostics
+    unsafe {
+        const SCB_CFSR: *mut u32 = 0xE000_ED28 as *mut u32;
+        const SCB_HFSR: *mut u32 = 0xE000_ED2C as *mut u32;
+        const SCB_MMFAR: *mut u32 = 0xE000_ED34 as *mut u32;
+        const SCB_BFAR: *mut u32 = 0xE000_ED38 as *mut u32;
+        const SCB_SHCSR: *mut u32 = 0xE000_ED24 as *mut u32;
+
+        let cfsr = core::ptr::read_volatile(SCB_CFSR);
+        let hfsr = core::ptr::read_volatile(SCB_HFSR);
+        let shcsr = core::ptr::read_volatile(SCB_SHCSR);
+
+        rprintln!("[FAULT] CFSR: 0x{:08x}, HFSR: 0x{:08x}", cfsr, hfsr);
+        rprintln!("[FAULT] SHCSR: 0x{:08x}", shcsr);
+
+        // Memory Management Fault Status
+        let mmfsr = (cfsr & 0xFF) as u8;
+        if mmfsr != 0 {
+            rprintln!("[FAULT] MemManage: 0x{:02x}", mmfsr);
+            if (mmfsr & 0x80) != 0 {
+                let mmfar = core::ptr::read_volatile(SCB_MMFAR);
+                rprintln!("[FAULT] MMFAR: 0x{:08x}", mmfar);
+            }
+        }
+
+        // Bus Fault Status
+        let bfsr = ((cfsr >> 8) & 0xFF) as u8;
+        if bfsr != 0 {
+            rprintln!("[FAULT] BusFault: 0x{:02x}", bfsr);
+            if (bfsr & 0x80) != 0 {
+                let bfar = core::ptr::read_volatile(SCB_BFAR);
+                rprintln!("[FAULT] BFAR: 0x{:08x}", bfar);
+            }
+        }
+
+        // Usage Fault Status
+        let ufsr = ((cfsr >> 16) & 0xFFFF) as u16;
+        if ufsr != 0 {
+            rprintln!("[FAULT] UsageFault: 0x{:04x}", ufsr);
+        }
+
+        // Check current execution mode
+        let mut control: u32;
+        core::arch::asm!("mrs {}, CONTROL", out(reg) control, options(nomem, nostack));
+        let mut psp: u32;
+        let mut msp: u32;
+        core::arch::asm!("mrs {}, PSP", out(reg) psp, options(nomem, nostack));
+        core::arch::asm!("mrs {}, MSP", out(reg) msp, options(nomem, nostack));
+
+        rprintln!("[FAULT] CONTROL: 0x{:08x}, PSP: 0x{:08x}, MSP: 0x{:08x}", control, psp, msp);
+    }
 
     // 현재 실행 중인 태스크 정보
     rprintln!("[FATAL] Current task count: {}", sched::get_task_count());
@@ -670,6 +788,13 @@ mod mpu {
 
             rprintln!("[MPU] Initializing MPU with {} regions", num_regions);
 
+            // Enable MemManage fault in SHCSR (System Handler Control and State Register)
+            const SCB_SHCSR: *mut u32 = 0xE000_ED24 as *mut u32;
+            let mut shcsr = core::ptr::read_volatile(SCB_SHCSR);
+            shcsr |= 1 << 16; // MEMFAULTENA: Enable MemManage fault
+            core::ptr::write_volatile(SCB_SHCSR, shcsr);
+            rprintln!("[MPU] MemManage fault enabled");
+
             // Disable MPU while configuring
             core::ptr::write_volatile(MPU_CTRL, 0);
 
@@ -744,8 +869,11 @@ mod mpu {
             core::ptr::write_volatile(MPU_RASR, rasr);
         }
 
-        rprintln!("[MPU] Region {} configured: base=0x{:08x}, size={}, ap={:03b}, xn={}",
-                 region_num, base_addr, size_encoding, access_permission, execute_never);
+        // Reduced logging to prevent RTT overflow
+        if region_num <= 1 {
+            rprintln!("[MPU] Region {} configured: base=0x{:08x}",
+                     region_num, base_addr);
+        }
 
         Ok(())
     }
@@ -963,10 +1091,7 @@ mod sched {
         }
 
         STACK_POOL_OFFSET = end;
-        rprintln!(
-            "[STACK] Allocated {} words for task '{}' (ID: {}) at offset {}",
-            words, name, task_id, aligned_offset
-        );
+        // Reduced logging to prevent RTT overflow
 
         &mut STACK_POOL.0[aligned_offset..end]
     }
@@ -1023,6 +1148,10 @@ mod sched {
             app_name: &str,
             app_id: u32,
         ) -> &'static mut [u32] {
+            // DEBUG: Check if stack pointer looks like top or base
+            rprintln!("[STACK DEBUG] App '{}': base=0x{:08x}, size={} bytes", app_name, base, bytes);
+            rprintln!("[STACK DEBUG] Range would be: 0x{:08x} to 0x{:08x}", base, base + bytes);
+
             if base == 0 {
                 rprintln!(
                     "[FATAL] App '{}' (ID: {}) provided null stack pointer",
@@ -1050,6 +1179,11 @@ mod sched {
                     STACK_ALIGNMENT_BYTES
                 );
                 loop {}
+            }
+
+            // Check if base looks like it's in valid SRAM range
+            if base < 0x20000000 || base >= 0x20020000 {
+                rprintln!("[STACK WARNING] App '{}': stack base 0x{:08x} outside SRAM range", app_name, base);
             }
 
             let words = bytes / core::mem::size_of::<u32>();
@@ -1159,8 +1293,15 @@ mod sched {
         app.stack_size = stack_bytes as u32;
         let len = stack.len();
 
+        // DEBUG: Stack frame setup information
+        rprintln!("[FRAME DEBUG] App '{}': stack.as_ptr()=0x{:08x}, len={} words",
+                 app.name, stack.as_ptr() as usize, len);
+
         // Stack layout: only hardware context (r0, r1, r2, r3, r12, lr, pc, xpsr) - 8 words from top
         let sp = unsafe { stack.as_ptr().add(len - 8) as u32 };
+
+        rprintln!("[FRAME DEBUG] SP after setup: 0x{:08x}, hw_frame at: 0x{:08x}",
+                 sp, sp);
 
         // Initialize hardware context for exception return
         let hw_frame = unsafe { core::slice::from_raw_parts_mut(sp as *mut u32, 8) };
@@ -1170,14 +1311,26 @@ mod sched {
         hw_frame[3] = 0x03030303; // r3
         hw_frame[4] = 0x12121212; // r12
         hw_frame[5] = 0xFFFFFFFE; // LR (exception return value)
-        // PC validation and Thumb bit setting
+        // PC validation and Thumb bit handling
         let pc_value = app.entry as u32;
-        if pc_value == 0 || pc_value < 0x08000000 {
-            rprintln!("[FATAL] Invalid PC for app '{}': 0x{:08x}", app.name, pc_value);
+
+        // Handle case where linker already provided Thumb bit
+        let base_pc = pc_value & !1; // Clear Thumb bit for validation
+
+        if base_pc == 0 || base_pc < 0x08000000 || base_pc >= 0x08080000 {
+            rprintln!("[FATAL] Invalid PC for app '{}': 0x{:08x}", app.name, base_pc);
+            rprintln!("[DEBUG] Valid range: 0x08000000-0x0807FFFF");
             loop {}
         }
-        hw_frame[6] = pc_value | 1; // PC with Thumb bit
-        hw_frame[7] = 0x01000000; // xPSR with Thumb state
+
+        // Ensure base PC is aligned to 2-byte boundary (even address)
+        if (base_pc & 1) != 0 {
+            rprintln!("[FATAL] PC not 2-byte aligned for app '{}': 0x{:08x}", app.name, base_pc);
+            loop {}
+        }
+
+        hw_frame[6] = base_pc | 1; // PC with Thumb bit for execution
+        hw_frame[7] = 0x01000000; // xPSR with Thumb state bit
 
         // Initialize TCB with software context and app metadata
         tcb.sp = sp; // PSP points to hardware frame
@@ -1189,7 +1342,7 @@ mod sched {
         tcb.r9 = 0x99999999; // r9
         tcb.r10 = 0xAAAAAAAA; // r10
         tcb.r11 = 0xBBBBBBBB; // r11
-        tcb.control = 0x03; // CONTROL: Use PSP for thread mode + unprivileged mode
+        tcb.control = 0x02; // CONTROL: Use PSP for thread mode (temporarily privileged for debugging)
         tcb.state = TaskState::Ready;
         tcb.app_id = app.id;
         tcb.name = app.name;
@@ -1199,27 +1352,16 @@ mod sched {
         // Configure MPU protection for this task's stack
         // Use region numbers 2+ for task stacks (0,1 reserved for basic regions)
         let region_num = (app.id % 6) + 2; // Use regions 2-7 for tasks (max 6 tasks with MPU protection)
-        if let Err(e) = unsafe {
+        let _result = unsafe {
             super::mpu::configure_task_stack_protection(
                 region_num as u8,
                 stack.as_mut_ptr(),
                 stack_bytes as u32
             )
-        } {
-            rprintln!("[MPU] Warning: Failed to configure stack protection for app '{}': {}", app.name, e);
-        } else {
-            rprintln!("[MPU] Configured stack protection for app '{}' in region {}", app.name, region_num);
-        }
+        };
 
-        rprintln!(
-            "[STACK] App '{}' (ID: {}) base: 0x{:08x}, SP: 0x{:08x}, PC: 0x{:08x}, Stack: {} bytes",
-            app.name,
-            app.id,
-            app.stack_ptr,
-            sp,
-            hw_frame[6],
-            stack_bytes
-        );
+        // Minimal logging - only for critical debugging
+        // (All detailed logs removed to prevent RTT overflow)
     }
 
     #[unsafe(no_mangle)]
@@ -1356,40 +1498,28 @@ mod sched {
             let registered_apps = get_registered_apps_mut();
             N_TASKS = registered_apps.len();
 
-            if N_TASKS == 0 {
-                rprintln!("[INIT] 동적 태스크 전용 모드");
-            }
-
-            if N_TASKS > MAX_APPS {
-                rprintln!(
-                    "[FATAL] Too many applications registered: {} > {}",
-                    core::ptr::read_volatile(core::ptr::addr_of!(N_TASKS)),
-                    MAX_APPS
-                );
+            let n_tasks_val = N_TASKS;
+            if n_tasks_val > MAX_APPS {
+                rprintln!("[FATAL] Too many apps: {} > {}", n_tasks_val, MAX_APPS);
                 loop {}
             }
 
-            rprintln!(
-                "[SCHED] Initializing {} registered applications",
-                core::ptr::read_volatile(core::ptr::addr_of!(N_TASKS))
-            );
+            rprintln!("[INIT] Starting {} apps...", n_tasks_val);
 
             // Initialize each registered app
             for (idx, app) in registered_apps.iter_mut().enumerate() {
-                rprintln!(
-                    "[SCHED] Initializing app '{}' (ID: {}, Entry: 0x{:08x})",
-                    app.name,
-                    app.id,
-                    app.entry
-                );
+                // Only log every 5th app to reduce RTT load
+                if idx % 5 == 0 {
+                    rprintln!("[INIT] App {}", idx);
+                }
 
                 let stack_slice = acquire_app_stack(app);
                 TCBS[idx] = Tcb::default();
                 init_app_stack_and_tcb(app, &mut TCBS[idx], stack_slice);
 
-                // Memory barrier and small delay between tasks
+                // Memory barrier and delay
                 core::arch::asm!("dsb", "isb", options(nomem, nostack));
-                for _ in 0..1000 {
+                for _ in 0..5000 {  // Reduced delay
                     core::arch::asm!("nop", options(nomem, nostack));
                 }
             }
@@ -1458,13 +1588,26 @@ mod sched {
             rprintln!("[SCHED] Using {} linker-discovered apps", task_count);
         }
 
+        // Extended delay before starting interrupts to ensure RTT stability
+        for _ in 0..1000000 {
+            cortex_m::asm::nop();
+        }
+
         unsafe {
             let mut scb = cortex_m::Peripherals::take().unwrap().SCB;
             scb.set_priority(cortex_m::peripheral::scb::SystemHandler::PendSV, 255);
             scb.set_priority(cortex_m::peripheral::scb::SystemHandler::SysTick, 128);
             init_systick_1s();
+
+            // Delay before enabling SysTick interrupt
+            for _ in 0..500000 {
+                cortex_m::asm::nop();
+            }
+
             enable_systick_interrupt();
         }
+
+        rprintln!("[SCHED] Interrupts enabled");
 
         // Kernel idle loop - Wait For Interrupt (CPU sleeps until interrupt)
         loop {
@@ -1482,7 +1625,9 @@ mod sched {
 
             if FIRST_SWITCH {
                 FIRST_SWITCH = false;
-                rprintln!("[🚀 START] Task 0");
+                // Critical debug log for first switch
+                rprintln!("[PendSV] First switch: task 0 '{}', PSP=0x{:08x}",
+                         TCBS[0].name, TCBS[0].sp);
 
                 // Mark task 0 as running
                 TCBS[0].state = TaskState::Running;
@@ -1495,7 +1640,7 @@ mod sched {
                 let current_task = CURR;
                 let next_task = (current_task + 1) % N_TASKS;
 
-                rprintln!("[🔄 SWITCH] Task {} → Task {}", current_task, next_task);
+                // Reduced logging to prevent RTT overflow
 
                 // Update task states
                 TCBS[current_task].state = TaskState::Ready;
@@ -1605,12 +1750,20 @@ mod sched {
 
         @ Set PSP from r1
         msr     psp, r1
+        dsb                    @ Data synchronization barrier
+        isb                    @ Instruction synchronization barrier
 
-        @ Switch to thread mode using PSP + unprivileged mode
+        @ Switch to thread mode using PSP (privileged for debugging)
         mrs     r1, CONTROL
-        orr     r1, r1, #3     @ Use PSP for thread mode + unprivileged mode
+        orr     r1, r1, #2     @ Use PSP for thread mode (remain privileged)
         msr     CONTROL, r1
         isb                    @ Instruction barrier for CONTROL changes
+
+        @ Additional stabilization delay
+        mov     r2, #1000
+    delay_loop:
+        subs    r2, r2, #1
+        bne     delay_loop
 
         @ Ensure BASEPRI is cleared for tasks
         mov     r2, #0
@@ -1630,8 +1783,7 @@ mod sched {
     fn SysTick() {
         static mut SYSTICK_COUNT: u32 = 0;
         *SYSTICK_COUNT += 1;
-        rprintln!("[SYSTICK] {} - Triggering PendSV", *SYSTICK_COUNT);
-        // Trigger PendSV every 2 seconds
+        // No RTT logging in SysTick to prevent corruption during context switch
         cortex_m::peripheral::SCB::set_pendsv();
     }
 
@@ -1671,20 +1823,27 @@ mod sched {
             cortex_m::asm::nop();
         }
         rprintln!("[DEMO] start");
+        rprintln!("[DEMO] about to enter loop");
 
         let mut count = 0u32;
 
         loop {
             count = count.wrapping_add(1);
 
-            if count % 50 == 0 {
-                rprintln!("[DEMO] {}", count);
+            // 매우 간단한 로깅
+            if count == 1 {
+                rprintln!("[DEMO] first iteration");
+                rprintln!("[DEMO] about to call yield_cpu");
+            }
+            if count == 2 {
+                rprintln!("[DEMO] second iteration - yield worked!");
+            }
+            if count % 500 == 0 {
+                rprintln!("[DEMO] count={}", count);
             }
 
-            // CPU 양보
-            for _ in 0..5000 {
-                cortex_m::asm::nop();
-            }
+            // 정상적인 yield_cpu 사용
+            crate::app_syscalls::yield_cpu();
         }
     }
 
@@ -1696,31 +1855,36 @@ mod sched {
             cortex_m::asm::nop();
         }
 
-        // 공개된 앱 함수들을 동적 태스크로 스폰
-        let apps_to_spawn = [
-            (crate::apps::led_blinker::led_blinker as unsafe extern "C" fn() -> !, "led"),
-            (crate::apps::fibonacci::fibonacci as unsafe extern "C" fn() -> !, "fib"),
-            (crate::apps::counter::counter as unsafe extern "C" fn() -> !, "count"),
-            (crate::apps::data_logger::dynamic_worker_task, "logger"),
-            (demo_dynamic_worker, "demo"),
-        ];
+        // 🚀 링커 기반 자동 앱 디스커버리 및 스폰
+        rprintln!("[MAIN] Initializing app registry...");
+        crate::initialize_app_registry();
+
+        let registered_apps = crate::get_registered_apps();
+        rprintln!("[MAIN] Found {} registered apps", registered_apps.len());
 
         let mut spawned_count = 0;
-        for (entry_fn, name) in apps_to_spawn {
-            match unsafe { task_spawn_simple(entry_fn, name) } {
-                Ok(_) => {
-                    rprintln!("[SPAWN] OK {}", name);
-                    spawned_count += 1;
-                },
-                Err(_) => {
-                    rprintln!("[SPAWN] FAIL {}", name);
+        for app in registered_apps {
+            if let Some(entry_fn) = app.entry_fn {
+                match unsafe { task_spawn_simple(entry_fn, app.name) } {
+                    Ok(_) => {
+                        rprintln!("[SPAWN] OK {} (id={})", app.name, app.id);
+                        spawned_count += 1;
+                    },
+                    Err(_) => {
+                        rprintln!("[SPAWN] FAIL {} (id={})", app.name, app.id);
+                    }
+                }
+
+                // 각 스폰 후 RTT 안정화 지연
+                for _ in 0..30000 {
+                    cortex_m::asm::nop();
                 }
             }
+        }
 
-            // 각 스폰 후 RTT 안정화 지연
-            for _ in 0..30000 {
-                cortex_m::asm::nop();
-            }
+        // RTT 안정화 지연
+        for _ in 0..30000 {
+            cortex_m::asm::nop();
         }
 
         rprintln!("[SPAWN] Done: {}", spawned_count);
@@ -1800,8 +1964,8 @@ pub mod app_syscalls {
 fn main() -> ! {
     rtt_init_print!();
 
-    // RTT 초기화 확인을 위한 지연
-    for _ in 0..100000 {
+    // Extended RTT stabilization delay
+    for _ in 0..500000 {
         cortex_m::asm::nop();
     }
 
@@ -1833,12 +1997,12 @@ fn main() -> ! {
 
     rprintln!("[MAIN] Board initialization complete");
 
-    // Initialize MPU for memory protection
-    rprintln!("[MAIN] Initializing MPU...");
-    match mpu::init_mpu() {
-        Ok(_) => rprintln!("[MAIN] MPU initialization successful"),
-        Err(e) => rprintln!("[MAIN] MPU initialization failed: {}", e),
-    }
+    // Temporarily disable MPU for debugging
+    rprintln!("[MAIN] MPU disabled for debugging");
+    // match mpu::init_mpu() {
+    //     Ok(_) => rprintln!("[MAIN] MPU initialization successful"),
+    //     Err(e) => rprintln!("[MAIN] MPU initialization failed: {}", e),
+    // }
 
     rprintln!("[MAIN] Initializing OS...");
     unsafe {

@@ -7,7 +7,10 @@ static mut TIMER_TICKS: u32 = 0;
 static mut TIMER_SECONDS: u32 = 0;
 
 #[app(id = 3, stack_size = 320, name = "timer")]
-fn timer() -> ! {
+pub unsafe extern "C" fn timer() -> ! {
+    // Direct RTT log to bypass syscall system
+    rtt_target::rprintln!("[APP] timer ENTERED - direct RTT log");
+
     // Use Tock-style debug printing
     crate::app_syscalls::debug_print(3, "Timer Application started - counting seconds!");
 

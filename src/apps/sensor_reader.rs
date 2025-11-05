@@ -5,7 +5,10 @@ use crate::app_syscalls;
 use app_macros::app;
 
 #[app(id = 7, stack_size = 384, name = "sensor_reader")]
-fn sensor_reader() -> ! {
+pub unsafe extern "C" fn sensor_reader() -> ! {
+    // Direct RTT log to bypass syscall system
+    rtt_target::rprintln!("[APP] sensor_reader ENTERED - direct RTT log");
+
     app_syscalls::debug_print(7, "Sensor Reader app starting!");
 
     let mut reading_count = 0u32;

@@ -5,7 +5,10 @@ use crate::app_syscalls;
 use app_macros::app;
 
 #[app(id = 8, stack_size = 256, name = "watchdog")]
-fn watchdog() -> ! {
+pub unsafe extern "C" fn watchdog() -> ! {
+    // Direct RTT log to bypass syscall system
+    rtt_target::rprintln!("[APP] watchdog ENTERED - direct RTT log");
+
     app_syscalls::debug_print(8, "🐕 Watchdog app 시작!");
 
     let mut heartbeat_count = 0u32;

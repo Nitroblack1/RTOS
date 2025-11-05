@@ -7,7 +7,10 @@ static mut PACKET_COUNT: u32 = 0;
 static mut BYTES_PROCESSED: u32 = 0;
 
 #[app(id = 6, stack_size = 512, name = "network_stack")]
-fn network_stack() -> ! {
+pub unsafe extern "C" fn network_stack() -> ! {
+    // Direct RTT log to bypass syscall system
+    rtt_target::rprintln!("[APP] network_stack ENTERED - direct RTT log");
+
     crate::app_syscalls::debug_print(6, "Network Stack Application started - processing packets!");
 
     loop {
